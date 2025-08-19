@@ -19,12 +19,13 @@ from fastapi import FastAPI
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("capital-bot")
 
-EU_TZ = tz.gettz("Europe/Rome")
+# ⚠️ Render non ha Europe/Rome: usiamo UTC
+APP_TZ = tz.gettz("UTC")
 
 CAPITAL_BASE_URL = os.getenv("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
 CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY")
-CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER")  # email di login piattaforma
-CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD")      # password della API key (non pwd account)
+CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER")  # email di login (LIVE) o clientId: usiamo email
+CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD")      # password della API key
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -32,19 +33,21 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 if not all([CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     logger.warning("Mancano una o più variabili d'ambiente richieste. Controlla ENV su Render.")
 
-# Asset definitivi
-ASSETS = [
-    "PLTR",
-    "GOOGL",
-    "ETH/USD",
-    "USD/JPY",
-    "LDO.MI",
-    "Fincantieri",
-    "Infineon",
-    "TSLA",
-    "EUR/USD",
-    "GBP/USD",
-]
+# =========================
+# Asset e termini di ricerca (multi-term)
+# =========================
+ASSET_SEARCH_TERMS: Dict[str, List[str]] = {
+    "PLTR":       ["PLTR", "PALANTIR", "PALANTIR TECHNOLOGIES"],
+    "GOOGL":      ["GOOGL", "ALPHABET", "ALPHABET INC", "GOOGLE"],
+    "ETH/USD":    ["ETH/USD", "ETHUSD", "ETHEREUM"],
+    "USD/JPY":    ["USD/JPY", "USDJPY"],
+    "LDO.MI":     ["LDO.MI", "LEONARDO", "LEONARDO S.P.A"],
+    "Fincantieri":["FINCANTIERI"],
+    "Infineon":   ["INFINEON", "INFINEON TECHNOLOGIES"],
+    "TSLA":       ["TSLA", "TESLA"],
+    "EUR/USD":    ["EUR/USD", "EURUSD"],
+    "GBP/USD":    ["GBP/USD", "GBPUSD"],
+}
 
 # Timeframe
 TF_RES_MAP = {
@@ -90,7 +93,6 @@ class CapitalAPI:
         logger.info("[CapitalAPI] Sessione avviata (auto‑refresh abilitato)")
 
     def _ensure_session(self) -> None:
-        # rinnova se > 9 minuti dall'ultimo uso
         if not self.cst or not self.sec_token or (time.time() - self.last_touch) > 540:
             self.login()
 
@@ -99,7 +101,7 @@ class CapitalAPI:
         url = f"{self.base_url}{path}"
         r = self.session.get(url, headers=self._auth_headers(), params=params or {}, timeout=30)
         if r.status_code == 401:
-            logger.warning("[CapitalAPI] 401 ricevuto, tento re‑login…")
+            logger.warning("[CapitalAPI] 401 ricevuto, re‑login…")
             self.login()
             r = self.session.get(url, headers=self._auth_headers(), params=params or {}, timeout=30)
         self.last_touch = time.time()
@@ -108,9 +110,9 @@ class CapitalAPI:
     def search_markets(self, term: str) -> List[Dict]:
         r = self._get("/api/v1/markets", params={"searchTerm": term})
         if r.status_code != 200:
-            raise RuntimeError(f"Markets search failed for {term}: {r.status_code} {r.text}")
-        data = r.json()
-        return data.get("markets", [])
+            logger.warning(f"Markets search failed for {term}: {r.status_code} {r.text}")
+            return []
+        return r.json().get("markets", [])
 
     def get_prices(self, epic: str, resolution: str, max_points: int = 300) -> Dict:
         r = self._get(f"/api/v1/prices/{epic}", params={"resolution": resolution, "max": max_points})
@@ -121,43 +123,56 @@ class CapitalAPI:
 # =========================
 # Utility
 # =========================
-def select_best_market(markets: List[Dict], wanted: str) -> Optional[Dict]:
-    wanted_up = wanted.upper()
+def _sanitize(s: str) -> str:
+    # Rimuove caratteri non alfanumerici (USD/JPY -> USDJPY)
+    return "".join(ch for ch in s if ch.isalnum())
+
+def select_best_market(markets: List[Dict], wanted_label: str) -> Optional[Dict]:
+    if not markets:
+        return None
     ranked = []
+    w = wanted_label.upper()
     for m in markets:
         instr = m.get("instrument", {})
         name = str(instr.get("name", "")).upper()
         symbol = str(instr.get("symbol", "")).upper()
         epic = instr.get("epic")
         product = m.get("product", "")
+        status = m.get("snapshot", {}).get("marketStatus")
         score = 0
-        if wanted_up in name or wanted_up in symbol:
+        if any(k in name for k in [w, _sanitize(w)]) or any(k in symbol for k in [w, _sanitize(w)]):
             score += 3
         if product == "CFD":
             score += 2
-        if m.get("snapshot", {}).get("marketStatus") == "TRADEABLE":
+        if status == "TRADEABLE":
             score += 1
         if epic:
             ranked.append((score, m))
-    if not ranked:
-        return None
     ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked[0][1]
+    return ranked[0][1] if ranked else None
 
-def build_epic_map(api: CapitalAPI, assets: List[str]) -> Dict[str, str]:
+def build_epic_map(api: CapitalAPI, asset_terms: Dict[str, List[str]]) -> Dict[str, str]:
     mapping = {}
-    for a in assets:
-        try:
-            markets = api.search_markets(a)
-            best = select_best_market(markets, a)
-            if best:
-                epic = best["instrument"]["epic"]
-                mapping[a] = epic
-                logger.info(f"Mappato {a} → {epic}")
-            else:
-                logger.warning(f"Nessun epic trovato per {a}")
-        except Exception as e:
-            logger.exception(f"Errore mapping epic per {a}: {e}")
+    for label, terms in asset_terms.items():
+        epic = None
+        for term in terms + [_sanitize(t) for t in terms]:
+            try:
+                mkts = api.search_markets(term)
+                if mkts:
+                    best = select_best_market(mkts, label)
+                    if not best:
+                        # fallback: prendi semplicemente il primo tradeable
+                        tradeables = [m for m in mkts if m.get("snapshot", {}).get("marketStatus") == "TRADEABLE"]
+                        best = tradeables[0] if tradeables else mkts[0]
+                    epic = best["instrument"]["epic"]
+                    logger.info(f"Mappato {label} ({term}) → {epic}")
+                    break
+            except Exception as e:
+                logger.warning(f"Search errore per {label}/{term}: {e}")
+        if not epic:
+            logger.warning(f"Nessun epic trovato per {label}")
+        else:
+            mapping[label] = epic
     return mapping
 
 # =========================
@@ -205,24 +220,13 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
 # Strategia pre‑rally
 # =========================
 def detect_pre_rally(df: pd.DataFrame) -> Optional[Dict]:
-    """
-    Regole:
-    1) Compressione: BBWidth al 20° percentile (ultimi 200) + ATR < 0.8 * ATR_MA(14)
-    2) Trend filter: EMA20 > EMA50 (long) / EMA20 < EMA50 (short)
-    3) Momentum: MACD hist in aumento/diminuzione + RSI cross 50 coerente
-    """
     if df is None or len(df) < 100:
         return None
+    close = df["close"]; high = df["high"]; low = df["low"]
 
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    ema20 = ema(close, 20)
-    ema50 = ema(close, 50)
+    ema20 = ema(close, 20); ema50 = ema(close, 50)
     rsi14 = rsi(close, 14)
-    atr14 = atr(high, low, close, 14)
-    atr_ma = atr14.rolling(14).mean()
+    atr14 = atr(high, low, close, 14); atr_ma = atr14.rolling(14).mean()
 
     lower, mid, upper = bollinger(close, 20, 2.0)
     bbw = (upper - lower) / (mid + 1e-9)
@@ -241,7 +245,6 @@ def detect_pre_rally(df: pd.DataFrame) -> Optional[Dict]:
     rsi_cross_down = rsi14.iloc[-1] < 50 <= rsi14.iloc[-2]
 
     price = close.iloc[-1]
-
     if comp_ok and trend_long and hist_up and rsi_cross_up:
         return {"side": "LONG", "price": float(price), "reason": "Compressione + EMA20>EMA50 + MACD↑ + RSI cross 50"}
     if comp_ok and trend_short and hist_down and rsi_cross_down:
@@ -278,7 +281,7 @@ def prices_to_df(raw: Dict) -> Optional[pd.DataFrame]:
         v = p.get("lastTradedVolume", 0)
         rows.append((t, o, h, l, c, v))
     df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"]).dropna()
-    df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert(EU_TZ)
+    df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert(APP_TZ)
     df.set_index("time", inplace=True)
     return df
 
@@ -290,24 +293,24 @@ class Scanner:
         self.api = api
         self.epic_map = epic_map
 
-    def scan_once(self, tf_label: str, assets: List[str]):
+    def scan_once(self, tf_label: str, labels: List[str]):
         res = TF_RES_MAP[tf_label]
-        for a in assets:
-            epic = self.epic_map.get(a)
+        for label in labels:
+            epic = self.epic_map.get(label)
             if not epic:
-                logger.warning(f"Skip {a}: epic non trovato")
+                logger.warning(f"Skip {label}: epic non trovato")
                 continue
             try:
                 raw = self.api.get_prices(epic, res, max_points=400)
                 df = prices_to_df(raw)
                 if df is None or len(df) < 60:
-                    logger.info(f"{a} {tf_label}: dati insufficienti")
+                    logger.info(f"{label} {tf_label}: dati insufficienti")
                     continue
                 sig = detect_pre_rally(df)
                 if sig:
-                    now = datetime.now(EU_TZ).strftime("%Y-%m-%d %H:%M")
+                    now = datetime.now(APP_TZ).strftime("%Y-%m-%d %H:%M")
                     msg = (
-                        f"<b>[CAPITAL][{tf_label}] {a} → {sig['side']}</b>\n"
+                        f"<b>[CAPITAL][{tf_label}] {label} → {sig['side']}</b>\n"
                         f"Prezzo: <b>{sig['price']:.5f}</b> | {now}\n"
                         f"Motivo: {sig['reason']}\n"
                         f"Epic: <code>{epic}</code>"
@@ -315,9 +318,9 @@ class Scanner:
                     logger.info(msg)
                     send_telegram(msg)
                 else:
-                    logger.info(f"{a} {tf_label}: nessun setup")
+                    logger.info(f"{label} {tf_label}: nessun setup")
             except Exception as e:
-                logger.exception(f"Errore scan {a} {tf_label}: {e}")
+                logger.exception(f"Errore scan {label} {tf_label}: {e}")
 
 # =========================
 # FastAPI + Scheduler
@@ -332,40 +335,36 @@ def _startup():
     logger.info("Avvio bot…")
     api = CapitalAPI(CAPITAL_BASE_URL, CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD)
     api.login()
-    epic_map = build_epic_map(api, ASSETS)
+    epic_map = build_epic_map(api, ASSET_SEARCH_TERMS)
     _scanner = Scanner(api, epic_map)
 
-    _scheduler = BackgroundScheduler(timezone=str(EU_TZ))
+    _scheduler = BackgroundScheduler(timezone="UTC")  # timezone stabile su Render
 
     # M1 (solo forex+crypto) ogni 1 minuto
-    _scheduler.add_job(lambda: _scanner.scan_once("M1", [a for a in ASSETS if a in M1_ASSETS]),
+    _scheduler.add_job(lambda: _scanner.scan_once("M1", [k for k in ASSET_SEARCH_TERMS if k in M1_ASSETS]),
                        CronTrigger(minute="*"))
 
     # M15 ogni 15 minuti
-    _scheduler.add_job(lambda: _scanner.scan_once("M15", ASSETS),
+    _scheduler.add_job(lambda: _scanner.scan_once("M15", list(ASSET_SEARCH_TERMS.keys())),
                        CronTrigger(minute="0,15,30,45"))
 
     # H1 ogni ora al minuto 0
-    _scheduler.add_job(lambda: _scanner.scan_once("H1", ASSETS),
+    _scheduler.add_job(lambda: _scanner.scan_once("H1", list(ASSET_SEARCH_TERMS.keys())),
                        CronTrigger(minute="0"))
 
-    # D1 ogni giorno alle 23:59 Europa/Roma
-    _scheduler.add_job(lambda: _scanner.scan_once("D1", ASSETS),
+    # D1 ogni giorno alle 23:59 UTC
+    _scheduler.add_job(lambda: _scanner.scan_once("D1", list(ASSET_SEARCH_TERMS.keys())),
                        CronTrigger(hour="23", minute="59"))
 
     _scheduler.start()
 
     # Primo giro subito
     try:
-        _scanner.scan_once("M15", ASSETS)
+        _scanner.scan_once("M15", list(ASSET_SEARCH_TERMS.keys()))
     except Exception as e:
         logger.exception(f"Scan di prova fallito: {e}")
 
 @app.get("/")
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now(EU_TZ).isoformat()}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    return {"status": "ok", "time": datetime.now(APP_TZ).isoformat()}
