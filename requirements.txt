@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+pandas
+numpy
+apscheduler
+python-dateutil
+pytz
