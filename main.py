@@ -1,116 +1,123 @@
-# Script principale aggiornato – GigaBot v1.0
-# Pre-rally detection multi-timeframe + visual Telegram alerts
+# 🚀 BOT TRADING - FINNHUB + TWELVEDATA + STRATEGIA POTENZIATA
+# Include: EMA, RSI, MACD, Volumi, Compressione + ATR, CCI, ADX (se disponibile)
 
-import os, time, logging, requests
+import os
+import requests
 from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI
+from pytz import timezone
+import time
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("pre-rally-bot")
+# 🔐 API Keys
+FINNHUB_API_KEY = os.environ['FINNHUB_API_KEY']
+TWELVEDATA_API_KEY = os.environ['TWELVEDATA_API_KEY']
+TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
+TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 
-FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "")
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TWELVEDATA_API   = os.getenv("TWELVEDATA_API", "")
+# 🕗 Finestra operativa (ora italiana)
+START_HOUR = 8
+END_HOUR = 23
 
-SYMBOLS = [
-    "PLTR", "GOOGL", "TSLA", "AAPL", "IFX.DE", "REY.MI", "MU", "AMD",
-    "FCT.MI", "XOM", "VLO", "GM", "MC.PA", "KO", "DIS",
-    "EUR/USD", "USD/JPY", "GBP/USD", "ETH/USD", "BTC/USD"
-]
+# 📈 Lista titoli finali (Ticker TwelveData / Finnhub)
+TITLES = {
+    "PLTR": "PLTR",
+    "GOOGL": "GOOGL",
+    "TSLA": "TSLA",
+    "AAPL": "AAPL",
+    "IFX.DE": "IFX.DE",
+    "REY.MI": "REY.MI",
+    "MU": "MU",
+    "AMD": "AMD",
+    "FCT.MI": "FCT.MI",
+    "XOM": "XOM",
+    "VLO": "VLO",
+    "GM": "GM",
+    "MC.PA": "MC.PA",
+    "KO": "KO",
+    "DIS": "DIS",
+    "EUR/USD": "EUR/USD",
+    "USD/JPY": "USD/JPY",
+    "GBP/USD": "GBP/USD",
+    "ETH/USD": "ETH/USD",
+    "BTC/USD": "BTC/USD"
+}
 
-ITALY_TZ_OFFSET = 2  # UTC+2
+# 📊 Indicatori da usare per ogni timeframe
+TIMEFRAMES = ["15min", "1h"]  # eventualmente aggiungi "1min" per crypto/forex
 
-app = FastAPI()
-_sched = None
+# 🔍 Funzione per ottenere dati OHLC da TwelveData
 
-def tg(msg: str):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=15)
-        if r.status_code != 200:
-            log.warning("Telegram %s %s", r.status_code, r.text)
-    except Exception as e:
-        log.warning("Telegram ex: %s", e)
+def get_ohlc(symbol, interval):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={TWELVEDATA_API_KEY}"
+    r = requests.get(url)
+    return r.json()
 
-def get_quote(symbol: str):
-    try:
-        r = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": symbol, "token": FINNHUB_API_KEY}, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except:
-        return {}
+# 🔍 Indicatori tecnici
 
-def is_active_hour():
-    now = datetime.utcnow().hour + ITALY_TZ_OFFSET
-    return 8 <= now < 23
+def calculate_indicators(data):
+    # Mock check: semplificato, sostituire con vera logica
+    indicators = {
+        "ema": True,
+        "rsi": True,
+        "macd": False,
+        "volumi": True,
+        "compressione": True,
+        "atr": True,
+        "cci": True,
+        "adx": True
+    }
+    return indicators
 
-def format_signal(sym, data, is_hot=False, score=3, indicators=None):
-    now = datetime.utcnow().strftime("%H:%M")
-    stars = "⭐️" * score + "☆" * (5 - score)
-    tf_signals = "\n".join([
-        f"• M15: {'✅ ' + ', '.join(indicators.get('M15', [])) if indicators.get('M15') else '—'}",
-        f"• H1 : {'✅ ' + ', '.join(indicators.get('H1', [])) if indicators.get('H1') else '—'}",
-        f"• D1 : {'✅ ' + ', '.join(indicators.get('D1', [])) if indicators.get('D1') else '—'}"
-    ])
+# 📬 Invio messaggio Telegram
 
-    comment = (
-        "💬 <b>Commento:</b>\n"
-        "Possibile inizio pre-rally. Configurazione interessante su più timeframe.\n"
-        "Conferma sopra i livelli chiave potrebbe generare un'accelerazione."
-    )
+def send_telegram_message(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML"
+    }
+    requests.post(url, data=payload)
 
-    msg = f"{'🔥 Titolo caldo del ciclo\n' if is_hot else ''}" \
-          f"<b>🟢 {sym}</b> {data.get('c', '—')} ({data.get('dp', '')}%) | {now}\n\n" \
-          f"<b>📊 Segnali attivi:</b>\n{tf_signals}\n\n" \
-          f"{comment}\n\n" \
-          f"<b>📈 Score segnale:</b> {stars}"
+# 📌 Costruzione del messaggio formato MIX #1 + #4 migliorato
 
+def build_message(ticker, price, change, time, signals, is_hot):
+    score = signals.count(True)
+    stars = "⭐" * score + "☆" * (5 - score)
+    check = lambda b: "✅" if b else "❌"
+
+    msg = f"\n<pre>"
+    msg += f"🟢 {ticker} {price} ({change:+.2f}%) | {time}\n"
+    msg += f"📊 Segnali attivi:\n"
+    msg += f"• M15 : {check(signals['ema'])} EMA, {check(signals['rsi'])} RSI\n"
+    msg += f"• H1  : {check(signals['compressione'])} Compressione, {check(signals['volumi'])} Volumi\n"
+    msg += f"• ATR : {check(signals['atr'])}  CCI: {check(signals['cci'])}  ADX: {check(signals['adx'])}\n"
+    msg += f"\n📈 Score segnale: {stars}"
+    if is_hot:
+        msg += f"\n🔥 Titolo caldo del ciclo"
+    msg += f"</pre>"
     return msg
 
-def fake_indicators():  # simulazione per test
-    return {
-        "M15": ["EMA", "RSI"],
-        "H1": ["Volumi", "Compressione"],
-        "D1": []
-    }
+# 🔁 Ciclo principale (mock semplificato)
 
-def scan():
-    if not is_active_hour():
-        log.info("🕒 Fuori orario. Nessuna scansione.")
+def run():
+    now = datetime.now(timezone('Europe/Rome'))
+    hour = now.hour
+    if not (START_HOUR <= hour <= END_HOUR):
         return
 
-    best = None
-    for sym in SYMBOLS:
-        q = get_quote(sym)
-        if not q or not q.get("c") or not q.get("pc"):
-            continue
+    for ticker, symbol in TITLES.items():
+        try:
+            data = get_ohlc(symbol, "15min")
+            price = float(data['values'][0]['close'])
+            change = float(price) * 0.01 * (-1 if "PLTR" in symbol else 1)  # simulazione
+            signals = calculate_indicators(data)
+            is_hot = signals['atr'] and signals['cci'] and score >= 4
+            msg = build_message(ticker, price, change, now.strftime("%H:%M"), signals, is_hot)
+            send_telegram_message(msg)
+        except Exception as e:
+            print(f"Errore su {ticker}: {e}")
 
-        change = (q["c"] - q["pc"]) / q["pc"] * 100
-        q["dp"] = f"{change:+.2f}"
-
-        indicators = fake_indicators()  # da sostituire con veri calcoli
-        score = len(indicators.get("M15", [])) + len(indicators.get("H1", []))
-        is_hot = score >= 4 and not best
-        if is_hot: best = sym
-
-        msg = format_signal(sym, q, is_hot=is_hot, score=min(score, 5), indicators=indicators)
-        tg(msg)
-        time.sleep(1.5)
-
-@app.on_event("startup")
-def startup():
-    global _sched
-    log.info("⏳ Avvio pre-rally-bot…")
-    _sched = BackgroundScheduler(timezone="UTC")
-    _sched.add_job(scan, CronTrigger(minute="*/15"))
-    _sched.start()
-    scan()
-
-@app.get("/")
-@app.get("/health")
-def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
+if __name__ == "__main__":
+    while True:
+        run()
+        time.sleep(900)  # ogni 15 minuti
