@@ -2,8 +2,13 @@
 import os, threading, time, requests
 from datetime import datetime, timedelta
 import pandas as pd
-import pandas_ta as ta
+
 import numpy as np
+# compat per vecchi import interni: from numpy import NaN
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+
+import pandas_ta as ta
 import pytz
 from flask import Flask
 from dotenv import load_dotenv
