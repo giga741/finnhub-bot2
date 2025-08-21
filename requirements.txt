@@ -6,4 +6,4 @@ numpy
 pandas_ta
 pytz
 setuptools
-pkg_resources
+
