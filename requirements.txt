@@ -1,3 +1,7 @@
 Flask
 python-dotenv
 requests
+pandas
+numpy
+pandas_ta
+pytz
