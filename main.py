@@ -1,373 +1,541 @@
-# main.py — Pre-rally bot (Finnhub + TwelveData)
-# Env: FINNHUB_API_KEY, TWELVEDATA_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# Optional: TZ=Europe/Rome, ACTIVE_HOURS_START=08:45, ACTIVE_HOURS_END=23:15,
-# SCORE_MIN=3, ENABLE_SHORT_ONLY=true, SAFE_MODE=true, DRY_RUN=false, POLL_SECONDS=60
+import os, time, math, json, threading, traceback, statistics
+from datetime import datetime, timedelta
+import pytz
+import requests
+import numpy as np
+import pandas as pd
+from flask import Flask, jsonify
 
-import os, asyncio
-from datetime import datetime, time, timedelta, timezone
-from typing import List, Tuple, Dict, Optional
-import httpx
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+# =========================
+# CONFIG
+# =========================
+TZ = pytz.timezone("Europe/Rome")
+ACTIVE_START = (8, 45)   # 08:45
+ACTIVE_END   = (23, 0)   # 23:00
+CHECK_EVERY_MIN = 15     # run cadence in minutes
+MIN_SCORE_TO_ALERT = 3
 
-# ---------- Timezone ----------
-TZ = os.getenv("TZ", "Europe/Rome")
-try:
-    import zoneinfo
-    TZINFO = zoneinfo.ZoneInfo(TZ)
-except Exception:
-    TZINFO = timezone(timedelta(hours=2))  # fallback
+# Secrets (Render -> Environment)
+FINNHUB_API_KEY     = os.getenv("FINNHUB_API_KEY", "")
+TWELVEDATA_API_KEY  = os.getenv("TWELVEDATA_API_KEY", "")
+TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+# Facoltativo: limiti
+TD_RATE_SLEEP = float(os.getenv("TD_RATE_SLEEP", "1.2"))  # pausa tra chiamate TwelveData
 
-ACTIVE_HOURS_START = os.getenv("ACTIVE_HOURS_START", "08:45")
-ACTIVE_HOURS_END   = os.getenv("ACTIVE_HOURS_END", "23:15")
-POLL_SECONDS       = int(os.getenv("POLL_SECONDS", "60"))
-
-SAFE_MODE         = os.getenv("SAFE_MODE", "true").lower() == "true"
-DRY_RUN           = os.getenv("DRY_RUN", "false").lower() == "true"
-SCORE_MIN         = int(os.getenv("SCORE_MIN", "3"))
-ENABLE_SHORT_ONLY = os.getenv("ENABLE_SHORT_ONLY", "true").lower() == "true"
-
-FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
-TWELVE_KEY  = os.getenv("TWELVEDATA_API_KEY", "")
-TG_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
-TG_CHAT     = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# ---------- Assets ----------
+# =========================
+# ASSET LIST & SYMBOL MAPS
+# =========================
+# type: equity | forex | crypto
 ASSETS = [
-    "PLTR","GOOGL","TSLA","AAPL","MU","AMD",
-    "FCT.MI","XOM","VLO","GM",
-    "MC.PA","KO","DIS",
-    "IFX.DE","REY.MI",
-    "EURUSD","USDJPY","GBPUSD",
-    "ETHUSD","BTCUSD",
+    # --- Tech US
+    {"name":"Palantir", "type":"equity", "fin":"PLTR",   "td":"PLTR"},
+    {"name":"Google (Alphabet A)", "type":"equity", "fin":"GOOGL", "td":"GOOGL"},
+    {"name":"Tesla",   "type":"equity", "fin":"TSLA",   "td":"TSLA"},
+    {"name":"Apple",   "type":"equity", "fin":"AAPL",   "td":"AAPL"},
+    {"name":"Micron",  "type":"equity", "fin":"MU",     "td":"MU"},
+    {"name":"AMD",     "type":"equity", "fin":"AMD",    "td":"AMD"},
+    # --- EU Tech / Industrial
+    {"name":"Infineon",     "type":"equity", "fin":"IFX.DE", "td":"IFX:XETRA"},
+    {"name":"Reply",        "type":"equity", "fin":"REY.MI", "td":"REY:MI"},
+    {"name":"Fincantieri",  "type":"equity", "fin":"FCT.MI", "td":"FCT:MI"},
+    # --- Energy / Auto / Consumer
+    {"name":"ExxonMobil", "type":"equity", "fin":"XOM",   "td":"XOM"},
+    {"name":"Valero",     "type":"equity", "fin":"VLO",   "td":"VLO"},
+    {"name":"General Motors", "type":"equity", "fin":"GM", "td":"GM"},
+    {"name":"LVMH",       "type":"equity", "fin":"MC.PA", "td":"MC:PAR"},
+    {"name":"Coca-Cola",  "type":"equity", "fin":"KO",    "td":"KO"},
+    {"name":"Disney",     "type":"equity", "fin":"DIS",   "td":"DIS"},
+    # --- Forex
+    {"name":"EUR/USD", "type":"forex", "fin":"OANDA:EUR_USD", "td":"EUR/USD"},
+    {"name":"USD/JPY", "type":"forex", "fin":"OANDA:USD_JPY", "td":"USD/JPY"},
+    {"name":"GBP/USD", "type":"forex", "fin":"OANDA:GBP_USD", "td":"GBP/USD"},
+    # --- Crypto (USD)
+    {"name":"ETH/USD", "type":"crypto", "fin":"COINBASE:ETH-USD", "td":"ETH/USD"},
+    {"name":"BTC/USD", "type":"crypto", "fin":"COINBASE:BTC-USD", "td":"BTC/USD"},
 ]
-SYMBOL_MAP = {
-    "PLTR":{"finnhub":"PLTR","twelvedata":"PLTR"},
-    "GOOGL":{"finnhub":"GOOGL","twelvedata":"GOOGL"},
-    "TSLA":{"finnhub":"TSLA","twelvedata":"TSLA"},
-    "AAPL":{"finnhub":"AAPL","twelvedata":"AAPL"},
-    "MU":{"finnhub":"MU","twelvedata":"MU"},
-    "AMD":{"finnhub":"AMD","twelvedata":"AMD"},
-    "XOM":{"finnhub":"XOM","twelvedata":"XOM"},
-    "VLO":{"finnhub":"VLO","twelvedata":"VLO"},
-    "GM":{"finnhub":"GM","twelvedata":"GM"},
-    "MC.PA":{"finnhub":"MC.PA","twelvedata":"MC:PA"},
-    "KO":{"finnhub":"KO","twelvedata":"KO"},
-    "DIS":{"finnhub":"DIS","twelvedata":"DIS"},
-    "FCT.MI":{"finnhub":"FCT.MI","twelvedata":"FCT:MI"},
-    "IFX.DE":{"finnhub":"IFX.DE","twelvedata":"IFX:XETRA"},
-    "REY.MI":{"finnhub":"REY.MI","twelvedata":"REY:MI"},
-    "EURUSD":{"finnhub":"OANDA:EUR_USD","twelvedata":"EUR/USD"},
-    "USDJPY":{"finnhub":"OANDA:USD_JPY","twelvedata":"USD/JPY"},
-    "GBPUSD":{"finnhub":"OANDA:GBP_USD","twelvedata":"GBP/USD"},
-    "ETHUSD":{"finnhub":"BINANCE:ETHUSDT","twelvedata":"ETH/USD"},
-    "BTCUSD":{"finnhub":"BINANCE:BTCUSDT","twelvedata":"BTC/USD"},
-}
-INTRADAY_M1 = {"EURUSD","USDJPY","GBPUSD","ETHUSD","BTCUSD"}
-TF_LIST = ["15min","1h","1day"]  # M15, H1, D1
 
-# ---------- State ----------
-LAST_SIGNALS: List[dict] = []
-LAST_ERROR: Optional[str] = None
-STARTED_AT = datetime.now(TZINFO).isoformat()
+# quali asset usano M1 oltre a M15/H1
+M1_WHITELIST = {a["name"] for a in ASSETS if a["type"] in ("forex","crypto")}
 
-# ---------- Indicators ----------
-def ema(series: List[float], period: int) -> List[float]:
-    if not series: return []
-    k = 2.0 / (period + 1.0)
-    out = []; e = series[0]
-    for p in series:
-        e = p*k + e*(1.0-k); out.append(e)
-    return out
+# =========================
+# UTILS
+# =========================
+def now_rome():
+    return datetime.now(TZ)
 
-def sma(series: List[float], period: int) -> List[float]:
-    out=[]; s=0.0
-    for i,v in enumerate(series):
-        s += v
-        if i >= period: s -= series[i-period]
-        out.append(s/period if i+1>=period else s/max(1,i+1))
-    return out
+def within_active_hours(ts: datetime):
+    start = ts.replace(hour=ACTIVE_START[0], minute=ACTIVE_START[1], second=0, microsecond=0)
+    end   = ts.replace(hour=ACTIVE_END[0],   minute=ACTIVE_END[1],   second=0, microsecond=0)
+    return start <= ts <= end
 
-def rsi(prices: List[float], period: int = 14) -> List[float]:
-    if len(prices) < period+1: return [50.0]*len(prices)
-    gains=[0.0]; losses=[0.0]
-    for i in range(1,len(prices)):
-        ch=prices[i]-prices[i-1]
-        gains.append(max(ch,0.0)); losses.append(abs(min(ch,0.0)))
-    ag=sum(gains[1:period+1])/period; al=sum(losses[1:period+1])/period
-    rsis=[50.0]*len(prices)
-    for i in range(period+1,len(prices)):
-        ag=(ag*(period-1)+gains[i])/period
-        al=(al*(period-1)+losses[i])/period
-        rsis[i] = 100.0 if al==0 else 100.0 - (100.0/(1.0+ag/al))
-    return rsis
+def unix_time(dt):
+    return int(dt.timestamp())
 
-def macd(prices: List[float]) -> Tuple[List[float], List[float], List[float]]:
-    e12=ema(prices,12); e26=ema(prices,26)
-    line=[a-b for a,b in zip(e12,e26)]
-    sig=ema(line,9); hist=[a-b for a,b in zip(line,sig)]
-    return line,sig,hist
+def safe_float(x):
+    try: return float(x)
+    except: return np.nan
 
-def true_range(h,l,c):
-    tr=[h[0]-l[0]]
-    for i in range(1,len(c)):
-        tr.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
-    return tr
+def pct(a, b):
+    if b == 0 or math.isclose(b,0.0): return 0.0
+    return 100.0 * (a - b) / b
 
-def atr(h,l,c,period=14):
-    tr=true_range(h,l,c)
-    if not tr: return []
-    if len(tr)<period:
-        avg=sum(tr)/max(1,len(tr)); return [avg]*len(c)
-    sm=sum(tr[:period])/period; out=[sm]
-    for i in range(period,len(tr)):
-        sm=(sm*(period-1)+tr[i])/period; out.append(sm)
-    while len(out)<len(c): out.insert(0,out[0])
-    return out
+def stars_from_score(score):
+    # 0..10 -> 0..5 stelle (½ arrotondato)
+    s = max(0, min(10, int(round(score))))
+    half = s / 2.0
+    full = int(half)
+    half_star = (half - full) >= 0.5
+    return "★" * full + ("½" if half_star else "") + "☆" * (5 - full - (1 if half_star else 0))
 
-def adx(h,l,c,period=14):
-    if len(c)<period+2: return [0.0]*len(c)
-    plus_dm=[0.0]; minus_dm=[0.0]; tr=[0.0]
-    for i in range(1,len(c)):
-        up=h[i]-h[i-1]; dn=l[i-1]-l[i]
-        plus_dm.append(up if up>dn and up>0 else 0.0)
-        minus_dm.append(dn if dn>up and dn>0 else 0.0)
-        tr.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
-    def smooth(arr):
-        sm=[0.0]*len(arr); sm[period]=sum(arr[1:period+1])
-        for i in range(period+1,len(arr)): sm[i]=sm[i-1]-(sm[i-1]/period)+arr[i]
-        return sm
-    tr_s=smooth(tr); p_s=smooth(plus_dm); m_s=smooth(minus_dm)
-    dx=[0.0]*len(c)
-    for i in range(period,len(c)):
-        if tr_s[i]==0: continue
-        pdi=100.0*(p_s[i]/tr_s[i]); mdi=100.0*(m_s[i]/tr_s[i]); den=pdi+mdi
-        if den==0: continue
-        dx[i]=100.0*abs(pdi-mdi)/den
-    ad=[0.0]*len(c); val=sum(dx[period:period*2])/period if len(c)>=period*2 else dx[-1]
-    for i in range(period*2,len(c)): val=(val*(period-1)+dx[i])/period; ad[i]=val
-    return ad
+# =========================
+# DATA PROVIDERS
+# =========================
+def fetch_finnhub_candles(symbol, market_type, resolution, bars=300):
+    """
+    resolution: '1','5','15','60','D'
+    market_type: 'equity' | 'forex' | 'crypto'
+    """
+    if not FINNHUB_API_KEY:
+        return None
+    end = int(time.time())
+    # 300 bars* interval
+    if resolution == 'D':
+        start = end - 86400*500
+    elif resolution == '60':
+        start = end - 3600*500
+    elif resolution == '15':
+        start = end - 900*500
+    elif resolution == '5':
+        start = end - 300*500
+    else:
+        start = end - 60*500
+    base = "https://finnhub.io/api/v1"
+    if market_type == 'equity':
+        url = f"{base}/stock/candle"
+        params = {"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": FINNHUB_API_KEY}
+    elif market_type == 'forex':
+        url = f"{base}/forex/candle"
+        params = {"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": FINNHUB_API_KEY}
+    else: # crypto
+        url = f"{base}/crypto/candle"
+        params = {"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": FINNHUB_API_KEY}
 
-def compression_index(c,look=20):
-    if len(c)<look: return 1.0
-    w=c[-look:]; rng=max(w)-min(w)
-    if rng<=0: return 0.0
-    wig=sum(abs(w[i]-w[i-1]) for i in range(1,len(w)))/(look-1)
-    return wig/rng  # lower = tighter
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        return None
+    j = r.json()
+    if j.get("s") != "ok":
+        return None
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(j["t"], unit="s"),
+        "open": j["o"], "high": j["h"], "low": j["l"], "close": j["c"], "volume": j.get("v", [np.nan]*len(j["c"]))
+    })
+    df = df.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
+    return df
 
-def support_resistance(c,look=30):
-    if len(c)<look: return None,None
-    w=c[-look:]; return min(w),max(w)
+def fetch_twelvedata_series(symbol, interval, outputsize=300):
+    if not TWELVEDATA_API_KEY:
+        return None
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY,
+        "format": "JSON"
+    }
+    r = requests.get(url, params=params, timeout=25)
+    if r.status_code != 200:
+        return None
+    j = r.json()
+    if "values" not in j:
+        return None
+    vals = j["values"]
+    df = pd.DataFrame(vals)
+    # TD returns strings
+    for c in ["open","high","low","close","volume"]:
+        if c in df.columns:
+            df[c] = df[c].apply(safe_float)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df[["datetime","open","high","low","close","volume"]]
 
-def detect_pattern_basic(c):
-    if not c or len(c)<20: return None
-    last=c[-20:]
-    hs=(max(last[:10]) - max(last[10:]))
-    ls=(min(last[10:]) - min(last[:10]))
-    if hs>0 and ls>0: return "Triangolo ascendente"
-    if last[-1]<last[0] and (max(last)-min(last))/max(1e-9,last[-1])<0.03: return "Flag ribassista"
+def get_ohlc(asset_name, tf):
+    """
+    tf: '1min' | '15min' | '1h' | '1day'
+    maps to Finnhub resolutions: '1','15','60','D'
+    """
+    asset = next(a for a in ASSETS if a["name"] == asset_name)
+    res_map = {"1min":"1", "15min":"15", "1h":"60", "1day":"D"}
+    # 1) prova Finnhub
+    df = fetch_finnhub_candles(asset["fin"], asset["type"], res_map[tf])
+    if df is not None and len(df) > 50:
+        return df
+    # 2) fallback TwelveData
+    td = {"1min":"1min","15min":"15min","1h":"1h","1day":"1day"}[tf]
+    df2 = fetch_twelvedata_series(asset["td"], td, outputsize=400 if tf!="1day" else 600)
+    return df2
+
+# =========================
+# INDICATORI
+# =========================
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
+
+def rsi(series, n=14):
+    delta = series.diff()
+    up = delta.clip(lower=0.0)
+    down = -1*delta.clip(upper=0.0)
+    ma_up = up.ewm(alpha=1/n, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/n, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    rsi = 100 - (100/(1+rs))
+    return rsi.fillna(50.0)
+
+def bollinger_width(close, n=20):
+    ma = close.rolling(n).mean()
+    std = close.rolling(n).std(ddof=0)
+    upper = ma + 2*std
+    lower = ma - 2*std
+    width = (upper - lower) / ma
+    return width, ma, upper, lower
+
+def ema_distance(close, n1=20, n2=50):
+    e1 = ema(close, n1)
+    e2 = ema(close, n2)
+    dist = (e1 - e2).abs() / close
+    trend_up = (close > e1) & (e1 > e2)
+    trend_dn = (close < e1) & (e1 < e2)
+    return dist, trend_up, trend_dn, e1, e2
+
+def volume_surge(vol, n=20):
+    base = vol.rolling(n).mean()
+    return vol / (base.replace(0,np.nan))
+
+def bb_compression_percentile(width, lookback=120):
+    # percentile del valore attuale rispetto alla storia recente
+    hist = width.tail(lookback+1).iloc[:-1].dropna()
+    if len(hist) < 10 or math.isnan(width.iloc[-1]):
+        return 100.0
+    rank = sum(hist <= width.iloc[-1]) / len(hist) * 100.0
+    return rank
+
+def simple_support_resistance(df, lookback=40, swing=3):
+    # trova swing high/low recenti
+    highs = df["high"].values
+    lows  = df["low"].values
+    res_levels = []
+    sup_levels = []
+    for i in range(swing, len(df)-swing):
+        if highs[i] == max(highs[i-swing:i+swing+1]):
+            res_levels.append(highs[i])
+        if lows[i] == min(lows[i-swing:i+swing+1]):
+            sup_levels.append(lows[i])
+    res = np.median(res_levels[-5:]) if res_levels else np.nan
+    sup = np.median(sup_levels[-5:]) if sup_levels else np.nan
+    return sup, res
+
+def triangle_flag_heuristic(df, window=30):
+    seg = df.tail(window)
+    highs = seg["high"].reset_index(drop=True)
+    lows  = seg["low"].reset_index(drop=True)
+    x = np.arange(len(seg))
+    # regressione lineare
+    def slope(y):
+        xmean = x.mean(); ymean = y.mean()
+        num = ((x - xmean)*(y - ymean)).sum()
+        den = ((x - xmean)**2).sum()
+        return num/den if den!=0 else 0.0
+    s_high = slope(highs.values)
+    s_low  = slope(lows.values)
+    # convergenza se opposte e in modulo non troppo grandi
+    if (s_high < 0 and s_low > 0) and (abs(s_high)+abs(s_low) < (highs.mean()*0.02)):
+        return "triangolo"
+    # flag: trend deciso + canalino leggero contrario
+    closes = seg["close"].values
+    trend = slope(pd.Series(closes))
+    if abs(trend) > (seg["close"].mean()*0.02):
+        return "flag"
     return None
 
-# ---------- Data fetch ----------
-async def td_series(symbol, interval, client):
-    url="https://api.twelvedata.com/time_series"
-    p={"symbol":symbol,"interval":interval,"apikey":TWELVE_KEY,"outputsize":500,"order":"ASC"}
-    r=await client.get(url,params=p,timeout=30); r.raise_for_status(); return r.json()
+def weekly_phase_from_daily(df_d1):
+    # Fasi: accumulo (piatto con range stretto), esplosione (trend + range ampio), correzione (contro-trend)
+    closes = df_d1["close"]
+    width, ma, up, lo = bollinger_width(closes, n=20)
+    e20 = ema(closes, 20)
+    slope = (e20.iloc[-1] - e20.iloc[-5]) / (5 if len(e20)>5 else 1)
+    rng = (up - lo).iloc[-1]
+    narrow = bb_compression_percentile(width, lookback=100) < 30 and rng < (closes.iloc[-1]*0.06)
+    strong = abs(slope) > closes.iloc[-1]*0.002
+    if narrow and not strong:
+        return "accumulo"
+    if strong:
+        return "esplosione" if slope>0 else "correzione"
+    return "accumulo"
 
-async def fh_candle(symbol, interval, client):
-    url="https://finnhub.io/api/v1/stock/candle"
-    res={"15min":"15","1h":"60","1day":"D","1min":"1"}[interval]
-    now=int(datetime.now(tz=timezone.utc).timestamp()); fro=now-60*60*24*60
-    p={"symbol":symbol,"resolution":res,"from":fro,"to":now,"token":FINNHUB_KEY}
-    r=await client.get(url,params=p,timeout=30); r.raise_for_status(); return r.json()
+# =========================
+# STRATEGIA & SCORING
+# =========================
+def analyze_asset(asset):
+    name = asset["name"]
+    # --- timeframes
+    tfs = ["15min","1h"]
+    if name in M1_WHITELIST: tfs = ["1min"] + tfs
+    tfs += ["1day"]
 
-def parse_td(js):
-    vals=js.get("values") or js.get("data") or []
-    c,h,l,o,v=[],[],[],[],[]
-    for row in vals:
-        try:
-            c.append(float(row["close"])); h.append(float(row["high"]))
-            l.append(float(row["low"]));  o.append(float(row["open"]))
-            v.append(float(row.get("volume",0.0)))
-        except: pass
-    return c,h,l,o,v
+    frames = {}
+    for tf in tfs:
+        df = get_ohlc(name, tf)
+        if df is None or len(df) < 60:
+            return None  # dati insufficienti -> skip
+        frames[tf] = df
 
-def parse_fh(js):
-    if js.get("s")!="ok": return [],[],[],[],[]
-    c=list(map(float,js.get("c",[]))); h=list(map(float,js.get("h",[])))
-    l=list(map(float,js.get("l",[]))); o=list(map(float,js.get("o",[])))
-    v=list(map(float,js.get("v",[]))) if "v" in js else [0.0]*len(c)
-    return c,h,l,o,v
+    # indicatori chiave su M15, H1
+    res = {"name": name, "calc":{}, "score":0, "flags":[]}
 
-# ---------- Scoring ----------
-def score_tf(c,h,l,v):
-    if len(c)<50: return 0, {}
-    ema9=ema(c,9); ema21=ema(c,21)
-    r=rsi(c,14); m_line,m_sig,_=macd(c); a=atr(h,l,c,14); ad=adx(h,l,c,14)
-    vol_sma = sma(v,20) if v else [0.0]*len(c)
+    def calc_on(df):
+        out = {}
+        close = df["close"]
+        vol   = df["volume"].fillna(0)
+        width, ma, up, lo = bollinger_width(close, n=20)
+        dist, trend_up, trend_dn, e20, e50 = ema_distance(close, 20, 50)
+        r = {
+            "rsi": rsi(close, 14).iloc[-1],
+            "bb_width": width.iloc[-1],
+            "bb_pct": bb_compression_percentile(width, lookback=120),
+            "ema20": e20.iloc[-1],
+            "ema50": e50.iloc[-1],
+            "ema_dist": dist.iloc[-1],
+            "ema_dist_mean": dist.tail(30).mean(),
+            "volume_surge": volume_surge(vol, 20).iloc[-1],
+            "close": close.iloc[-1]
+        }
+        # breakout S/R
+        sup, resi = simple_support_resistance(df)
+        r["support"] = sup
+        r["resistance"] = resi
+        r["breakout_up"] = (not math.isnan(resi)) and (close.iloc[-1] > resi * 1.001)
+        r["breakout_dn"] = (not math.isnan(sup))  and (close.iloc[-1] < sup  * 0.999)
+        r["pattern"] = triangle_flag_heuristic(df)
+        r["trend_up"] = trend_up.iloc[-1]
+        r["trend_dn"] = trend_dn.iloc[-1]
+        return r
 
-    cond={}
-    cond["EMA"]  = ema9[-1] < ema21[-1]
-    cond["RSI"]  = r[-1] < 50.0
-    cond["MACD"] = m_line[-1] < m_sig[-1]
-    cond["COMP"] = compression_index(c,20) < 0.55
-    cond["VOL"]  = (v[-1] > vol_sma[-1]) if v and vol_sma else False
-    cond["ADX"]  = ad[-1] > 20.0
-    cond["TREND_DOWN"] = (ema21[-1] < ema21[-2]) and (c[-1] < ema21[-1])
+    m15 = calc_on(frames["15min"])
+    h1  = calc_on(frames["1h"])
+    res["calc"]["M15"] = m15
+    res["calc"]["H1"]  = h1
 
-    score=0
-    for k in ["EMA","RSI","MACD","COMP","ADX","TREND_DOWN"]:
-        score += 2 if cond.get(k,False) else 0
-    score += 1 if cond.get("VOL",False) else 0
-    return min(10,score), cond
+    # D1 per fase/alert speciale
+    d1  = calc_on(frames["1day"])
+    res["calc"]["D1"]  = d1
+    # compressione daily multi-day
+    d1_width_series, _, _, _ = bollinger_width(frames["1day"]["close"], 20)
+    d1_pct = bb_compression_percentile(d1_width_series, lookback=200)
+    res["calc"]["D1_pct"] = d1_pct
 
-def cycle_phase(c):
-    if len(c)<60: return "Neutrale"
-    e21=ema(c,21); e50=ema(c,50)
-    comp=compression_index(c,20)
-    slope=(e21[-1]-e50[-1])/max(1e-9,c[-1])
-    if comp<0.45 and abs(slope)<0.004: return "Accumulo"
-    if e21[-1]<e50[-1] and abs(slope)>0.004: return "Correzione"
-    if e21[-1]>e50[-1] and abs(slope)>0.004: return "Esplosione"
-    return "Recupero" if e21[-1]>e50[-1] else "Neutrale"
+    # Direzione prevalente
+    long_bias  = (m15["trend_up"] or h1["trend_up"]) and m15["rsi"]>50 and h1["rsi"]>50
+    short_bias = (m15["trend_dn"] or h1["trend_dn"]) and m15["rsi"]<50 and h1["rsi"]<50
+    direction = "LONG" if long_bias and not short_bias else "SHORT" if short_bias and not long_bias else "NEUTRO"
+    res["direction"] = direction
 
-def exceptional(c_d1):
-    if len(c_d1)<120: return False
-    last=c_d1[-120:]; rng=max(last)-min(last)
-    if rng<=0: return False
-    wig=sum(abs(last[i]-last[i-1]) for i in range(1,len(last)))/(rng*(len(last)-1))
-    return wig<0.2
+    # Scoring (0-10)
+    score = 0
+    # 1) Compressione BB (più su M15)
+    if m15["bb_pct"] < 30: score += 2; res["flags"].append("BB squeeze M15")
+    if h1["bb_pct"]  < 30: score += 1
+    # 2) EMA squeeze 20/50
+    if m15["ema_dist"] < m15["ema_dist_mean"]*0.8: score += 1
+    if h1["ema_dist"]  < h1["ema_dist_mean"]*0.8: score += 1
+    # 3) RSI 50-cross / momentum
+    if 48 <= m15["rsi"] <= 55 or 48 <= h1["rsi"] <= 55: score += 2; res["flags"].append("RSI 50-cross")
+    # 4) Volume surge
+    if m15["volume_surge"] >= 1.5 or h1["volume_surge"] >= 1.5: score += 2; res["flags"].append("Volumi ↑")
+    # 5) Breakout S/R
+    if m15["breakout_up"] or h1["breakout_up"] or m15["breakout_dn"] or h1["breakout_dn"]:
+        score += 2; res["flags"].append("Breakout S/R")
+    # 6) Pattern
+    if m15["pattern"] or h1["pattern"]:
+        score += 1; res["flags"].append(f"Pattern {m15['pattern'] or h1['pattern']}")
 
-# ---------- Telegram ----------
-async def tg_send(text, client):
-    if SAFE_MODE or DRY_RUN:
-        print("[SAFE/DRY] Telegram suppressed:\n"+text); return
-    if not TG_TOKEN or not TG_CHAT:
-        print("[WARN] TELEGRAM env missing; skipping send."); return
-    url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload={"chat_id":TG_CHAT,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
-    r=await client.post(url,json=payload,timeout=20)
-    try: r.raise_for_status()
-    except Exception as e: print("[TG ERROR]", e, r.text)
+    score = min(10, score)
+    res["score"] = score
 
-def stars(n): return "★"*max(0,min(10,n)) + "☆"*(10-max(0,min(10,n)))
-def ck(b): return "✅" if b else "❌"
+    # Heatmap settimanale (fase ciclo)
+    phase = weekly_phase_from_daily(frames["1day"])
+    res["weekly_phase"] = phase
 
-def fmt_line_tf(tf, flags):
-    parts=[
-        f"{ck(flags.get('EMA',False))}EMA ↓",
-        f"{ck(flags.get('RSI',False))}RSI",
-        f"{ck(flags.get('MACD',False))}MACD ↓",
-        f"{ck(flags.get('COMP',False))}Compressione",
-    ]
-    if flags.get("VOL",False): parts.append("✅Volumi")
-    if flags.get("ADX",False): parts.append("✅ADX")
-    return f"• {tf}: " + "  ".join(parts)
+    # Exceptional alert
+    exceptional = (score >= 10) and (d1_pct < 10)
+    res["exceptional"] = exceptional
 
-def build_message(symbol, price, change_pct, score, m15, h1, d1, phase, pattern, hot):
-    red="🔴"; dir_txt="SHORT (ribasso)" if ENABLE_SHORT_ONLY else "Misto"
-    header = f"{red} {symbol} {price:.2f} ({change_pct:+.2f}%) | {datetime.now(TZINFO).strftime('%H:%M')}\n🕰️ Direzione: {dir_txt}"
-    lines=[
-        header,"",
-        "📊 Segnali attivi:",
-        fmt_line_tf("M15", m15),
-        fmt_line_tf("H1",  h1),
-        fmt_line_tf("D1",  d1),"",
-        f"🏷️ Fase attuale: {phase}",
-        f"📐 Pattern attivo: {pattern if pattern else 'n.d.'}","",
-        f"⭐ Score segnale: {stars(score)}",
-    ]
-    if hot: lines.append("🔥 Titolo caldo del ciclo")
-    return "\n".join(lines)
+    return res
 
-# ---------- Helpers ----------
-def within_hours(now_dt):
+# =========================
+# TELEGRAM
+# =========================
+def tg_send(html_text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram secrets mancanti, messaggio non inviato.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
-        sh,sm = map(int, ACTIVE_HOURS_START.split(":"))
-        eh,em = map(int, ACTIVE_HOURS_END.split(":"))
-        t=now_dt.timetz()
-        return time(sh,sm) <= t <= time(eh,em)
-    except: return True
+        r = requests.post(url, data=data, timeout=20)
+        if r.status_code != 200:
+            print("[TG] Errore invio:", r.text)
+    except Exception as e:
+        print("[TG] Eccezione:", e)
 
-# ---------- Core ----------
-async def process_symbol(sym_key, client):
-    out=[]; maps=SYMBOL_MAP.get(sym_key)
-    if maps is None: return out
+def format_msg(result):
+    name = result["name"]
+    s = result["score"]
+    dirn = result["direction"]
+    stars = stars_from_score(s)
+    m15 = result["calc"]["M15"]
+    h1  = result["calc"]["H1"]
+    d1  = result["calc"]["D1"]
+    flags = " | ".join(result["flags"]) if result["flags"] else "—"
 
-    data={}
-    for tf in TF_LIST:
-        c=h=l=o=v=[],[],[],[],[]
+    label_dir = ""
+    if dirn == "SHORT":
+        label_dir = "\n<b>🧭 Direzione: SHORT (ribasso)</b>"
+
+    hot = ""
+    if result["weekly_phase"] == "esplosione" and s >= 7:
+        hot = "\n🔥 <b>Titolo caldo del ciclo</b>"
+
+    # Previsioni operative: percentuali (no parola "Probabilità")
+    # semplice ripartizione coerente con direzione e segnali
+    long_pct  = 50
+    short_pct = 50
+    if dirn == "LONG":
+        long_pct = min(85, 55 + int(s*3))
+        short_pct = 100 - long_pct
+    elif dirn == "SHORT":
+        short_pct = min(85, 55 + int(s*3))
+        long_pct = 100 - short_pct
+
+    # supporti/resistenze
+    sup_m15 = m15["support"]; res_m15 = m15["resistance"]
+    sup_h1  = h1["support"];  res_h1  = h1["resistance"]
+
+    def fmt_level(x):
+        return f"{x:.4f}" if (x is not None and not math.isnan(x)) else "—"
+
+    header = (
+        f"<b>{name} — Pre‑rally Scanner</b>\n"
+        f"{stars}{hot}{label_dir}\n"
+        f"Fase ciclo (sett): <b>{result['weekly_phase']}</b>\n"
+        f"Score segnale: <b>{s}/10</b> | Trigger: <i>{flags}</i>\n"
+    )
+
+    # mini tabella timeframe
+    tf_block = (
+        "<b>Timeframe</b>\n"
+        f"M15 — RSI {m15['rsi']:.1f} | BB%tile {m15['bb_pct']:.0f} | Vol x{m15['volume_surge']:.2f} | "
+        f"S {fmt_level(sup_m15)} / R {fmt_level(res_m15)} | "
+        f"BRK ⬆ { '✓' if m15['breakout_up'] else '–' } ⬇ { '✓' if m15['breakout_dn'] else '–' }\n"
+        f"H1  — RSI {h1['rsi']:.1f}  | BB%tile {h1['bb_pct']:.0f}  | Vol x{h1['volume_surge']:.2f}  | "
+        f"S {fmt_level(sup_h1)} / R {fmt_level(res_h1)}  | "
+        f"BRK ⬆ { '✓' if h1['breakout_up'] else '–' } ⬇ { '✓' if h1['breakout_dn'] else '–' }\n"
+        f"D1  — BB%tile {result['calc']['D1_pct']:.0f} | EMA20 vs 50: "
+        f"{'↑' if d1['trend_up'] else ('↓' if d1['trend_dn'] else '→')}\n"
+    )
+
+    # Previsione operativa
+    prev = (
+        "<b>Previsione operativa</b>\n"
+        f"{long_pct}% — Scenario LONG: breakout/ritest sopra R H1, RSI>52 su M15, "
+        f"volumi ≥1.5x; gestione su pullback EMA20 M15.\n"
+        f"{short_pct}% — Scenario SHORT: perdita S H1 e chiusure sotto EMA20/50, "
+        f"RSI<48 su M15, volumi ≥1.5x; pullback falliti verso R per continuazione.\n"
+    )
+
+    consiglio = (
+        "<i>Consiglio personale:</i> attendi conferma su M15 (candela chiara + volume) "
+        "e verifica allineamento H1. Evita entrate in mezzo al range; meglio "
+        "break+retest o pullback su EMA20 M15. Stop sempre oltre S/R.\n"
+    )
+
+    exceptional = ""
+    if result["exceptional"]:
+        exceptional = "\n<b>⚠️ Segnale eccezionale</b>: Score 10/10 + compressione D1 multi‑day. " \
+                      "Contesto favorevole a espansione di volatilità."
+
+    return header + "\n" + tf_block + "\n" + prev + "\n" + consiglio + exceptional
+
+# =========================
+# LOOP PROGRAMMATO
+# =========================
+_last_run_key = None
+
+def should_run_now(ts):
+    # Allinea ai multipli di 15 min
+    return ts.minute % CHECK_EVERY_MIN == 0
+
+def runner_loop():
+    global _last_run_key
+    print("[INIT] Runner avviato.")
+    while True:
         try:
-            td=await td_series(maps["twelvedata"], tf, client); c,h,l,o,v = parse_td(td)
-        except: pass
-        if len(c)<50:
-            try:
-                fh=await fh_candle(maps["finnhub"], tf, client); c,h,l,o,v = parse_fh(fh)
-            except: pass
-        data[tf]=(c,h,l,o,v)
+            ts = now_rome()
+            key = ts.strftime("%Y-%m-%d %H:%M")
+            if within_active_hours(ts) and should_run_now(ts) and key != _last_run_key:
+                _last_run_key = key
+                print(f"[RUN] {key}")
+                run_scan_cycle()
+            time.sleep(5)  # controllo ogni 5s per beccare il minuto giusto
+        except Exception:
+            print("[ERR] Loop:", traceback.format_exc())
+            time.sleep(5)
 
-    if len(data.get("15min",([],[],[],[],[]))[0])<50: return out
+def run_scan_cycle():
+    for asset in ASSETS:
+        try:
+            res = analyze_asset(asset)
+            if not res: 
+                print(f"[SKIP] Dati insufficienti per {asset['name']}")
+                continue
+            if res["score"] >= MIN_SCORE_TO_ALERT:
+                msg = format_msg(res)
+                tg_send(msg)
+                print(f"[ALERT] {asset['name']} score={res['score']} dir={res['direction']}")
+            else:
+                print(f"[NOALERT] {asset['name']} score={res['score']}")
+            # piccola pausa per non stressare provider fallback
+            time.sleep(0.3)
+        except Exception:
+            print(f"[ERR] analyze {asset['name']}:", traceback.format_exc())
+            time.sleep(0.5)
 
-    total=0; flags={}
-    for tf in ["15min","1h","1day"]:
-        c,h,l,o,v = data[tf]
-        s,f = score_tf(c,h,l,v)
-        flags[tf]=f; total+=s
-    score = min(10, max(0, int(round(total/3))))
-    if score < SCORE_MIN: return out
+# =========================
+# WEB SERVER (Render)
+# =========================
+app = Flask(__name__)
 
-    c15=data["15min"][0]; price=c15[-1]
-    change_pct=((c15[-1]-c15[-2])/max(1e-9,c15[-2]))*100.0 if len(c15)>=2 else 0.0
-    cD=data["1day"][0]; phase=cycle_phase(cD) if cD else "Neutrale"
-    pattern=detect_pattern_basic(cD) if cD else None
-    hot = score>=9 and exceptional(cD)
-
-    msg=build_message(sym_key, price, change_pct, score, flags["15min"], flags["1h"], flags["1day"], phase, pattern, hot)
-    await tg_send(msg, client)
-
-    out.append({"symbol":sym_key,"score":score,"phase":phase,"pattern":pattern,"hot":hot,"time":datetime.now(TZINFO).isoformat()})
-    return out
-
-async def main_loop():
-    global LAST_SIGNALS, LAST_ERROR
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                now=datetime.now(TZINFO)
-                if not within_hours(now):
-                    await asyncio.sleep(POLL_SECONDS); continue
-                batch=[]
-                for s in ASSETS:
-                    try:
-                        sigs=await process_symbol(s, client); batch.extend(sigs)
-                    except Exception as e:
-                        print("[ERR]", s, e)
-                batch.sort(key=lambda x: x["score"], reverse=True)
-                LAST_SIGNALS=batch[-50:]; LAST_ERROR=None
-            except Exception as e:
-                LAST_ERROR=str(e); print("[LOOP ERROR]", e)
-            await asyncio.sleep(POLL_SECONDS)
-
-# ---------- API ----------
-app = FastAPI()
-
-@app.api_route("/", methods=["GET","HEAD"])
-def root():
-    return {"service":"pre-rally-bot","started_at":STARTED_AT,"safe_mode":SAFE_MODE,"score_min":SCORE_MIN}
-
-@app.api_route("/health", methods=["GET","HEAD"])
+@app.get("/health")
 def health():
-    return JSONResponse({"ok": LAST_ERROR is None, "error": LAST_ERROR, "signals_cached": len(LAST_SIGNALS)})
+    return jsonify({"ok": True, "time": now_rome().isoformat()})
 
-@app.get("/last_signals")
-def last_signals():
-    return JSONResponse(LAST_SIGNALS)
+@app.get("/")
+def root():
+    return "Bot pre‑rally attivo. Usa /health per check."
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(main_loop())
+def main():
+    # Avvia runner in background
+    t = threading.Thread(target=runner_loop, daemon=True)
+    t.start()
+    # Flask web (Render usa PORT)
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
 
-if __name__=="__main__":
-    import uvicorn
-    port=int(os.getenv("PORT","8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+if __name__ == "__main__":
+    main()
