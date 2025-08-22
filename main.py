@@ -539,3 +539,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+@app.get("/scan-now")
+def scan_now():
+    run_scan_cycle()
+    return jsonify({"run": "ok", "time": now_rome().isoformat()})
