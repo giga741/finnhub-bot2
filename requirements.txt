@@ -1,6 +1,9 @@
 setuptools
 wheel
-pip
-python-telegram-bot==20.3
+flask
+python-dotenv
 requests
-schedule 
+pandas==1.5.3
+numpy==1.23.5
+pandas_ta==0.3.14b0
+pytz 
