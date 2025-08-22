@@ -276,7 +276,10 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"status":"ok","app":APP_NAME,"version":VERSION,"time":now_rome().isoformat()}), 200
-
+# Alias di sicurezza: risponde anche se Render chiama /heal
+@app.route("/heal")
+def heal_alias():
+    return jsonify({"status":"ok","alias":"/heal"}), 200
 @app.route("/force", methods=["GET"])
 def force():
     tf = (request.args.get("tf","M15") or "M15").upper()
