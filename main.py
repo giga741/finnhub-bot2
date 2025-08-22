@@ -1,62 +1,76 @@
-import os, time, math, json, threading, traceback, statistics
+import os, threading, time, math, json, traceback
 from datetime import datetime, timedelta
-import pytz
 import requests
-import numpy as np
 import pandas as pd
-from flask import Flask, jsonify
+import numpy as np
+import pytz
+from flask import Flask, jsonify, request
 
 # =========================
-# CONFIG
+# CONFIGURAZIONE BASE
 # =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+
 TZ = pytz.timezone("Europe/Rome")
 ACTIVE_START = (8, 45)   # 08:45
 ACTIVE_END   = (23, 0)   # 23:00
-CHECK_EVERY_MIN = 15     # run cadence in minutes
-MIN_SCORE_TO_ALERT = 3
+MIN_SCORE = 3            # filtro minimo attivo (utente approvato)
+SEND_EXCEPTIONAL = True  # notifica speciale 10/10 + compressione D1
 
-# Secrets (Render -> Environment)
-FINNHUB_API_KEY     = os.getenv("FINNHUB_API_KEY", "")
-TWELVEDATA_API_KEY  = os.getenv("TWELVEDATA_API_KEY", "")
-TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-# Facoltativo: limiti
-TD_RATE_SLEEP = float(os.getenv("TD_RATE_SLEEP", "1.2"))  # pausa tra chiamate TwelveData
+APP_NAME = "Pre-Rally Scanner"
+VERSION = "1.2.0"
 
 # =========================
-# ASSET LIST & SYMBOL MAPS
+# LISTA ASSET (20) + MAPPATURE
+# td = TwelveData; fh = Finnhub (fallback)
+# type: stock | forex | crypto  (M1 attivo solo su forex/crypto)
 # =========================
-# type: equity | forex | crypto
-ASSETS = [
-    # --- Tech US
-    {"name":"Palantir", "type":"equity", "fin":"PLTR",   "td":"PLTR"},
-    {"name":"Google (Alphabet A)", "type":"equity", "fin":"GOOGL", "td":"GOOGL"},
-    {"name":"Tesla",   "type":"equity", "fin":"TSLA",   "td":"TSLA"},
-    {"name":"Apple",   "type":"equity", "fin":"AAPL",   "td":"AAPL"},
-    {"name":"Micron",  "type":"equity", "fin":"MU",     "td":"MU"},
-    {"name":"AMD",     "type":"equity", "fin":"AMD",    "td":"AMD"},
-    # --- EU Tech / Industrial
-    {"name":"Infineon",     "type":"equity", "fin":"IFX.DE", "td":"IFX:XETRA"},
-    {"name":"Reply",        "type":"equity", "fin":"REY.MI", "td":"REY:MI"},
-    {"name":"Fincantieri",  "type":"equity", "fin":"FCT.MI", "td":"FCT:MI"},
-    # --- Energy / Auto / Consumer
-    {"name":"ExxonMobil", "type":"equity", "fin":"XOM",   "td":"XOM"},
-    {"name":"Valero",     "type":"equity", "fin":"VLO",   "td":"VLO"},
-    {"name":"General Motors", "type":"equity", "fin":"GM", "td":"GM"},
-    {"name":"LVMH",       "type":"equity", "fin":"MC.PA", "td":"MC:PAR"},
-    {"name":"Coca-Cola",  "type":"equity", "fin":"KO",    "td":"KO"},
-    {"name":"Disney",     "type":"equity", "fin":"DIS",   "td":"DIS"},
-    # --- Forex
-    {"name":"EUR/USD", "type":"forex", "fin":"OANDA:EUR_USD", "td":"EUR/USD"},
-    {"name":"USD/JPY", "type":"forex", "fin":"OANDA:USD_JPY", "td":"USD/JPY"},
-    {"name":"GBP/USD", "type":"forex", "fin":"OANDA:GBP_USD", "td":"GBP/USD"},
-    # --- Crypto (USD)
-    {"name":"ETH/USD", "type":"crypto", "fin":"COINBASE:ETH-USD", "td":"ETH/USD"},
-    {"name":"BTC/USD", "type":"crypto", "fin":"COINBASE:BTC-USD", "td":"BTC/USD"},
-]
+ASSETS = {
+    # Tech
+    "PLTR":  {"td":"PLTR",         "fh":"PLTR",     "type":"stock", "name":"Palantir"},
+    "GOOGL": {"td":"GOOGL",        "fh":"GOOGL",    "type":"stock", "name":"Alphabet A"},
+    "TSLA":  {"td":"TSLA",         "fh":"TSLA",     "type":"stock", "name":"Tesla"},
+    "AAPL":  {"td":"AAPL",         "fh":"AAPL",     "type":"stock", "name":"Apple"},
+    "IFX":   {"td":"IFX:XETRA",    "fh":"IFX.DE",   "type":"stock", "name":"Infineon"},
+    "REY":   {"td":"REY:XMIL",     "fh":"REY.MI",   "type":"stock", "name":"Reply"},
+    "MU":    {"td":"MU",           "fh":"MU",       "type":"stock", "name":"Micron"},
+    "AMD":   {"td":"AMD",          "fh":"AMD",      "type":"stock", "name":"AMD"},
+    "NVDA":  {"td":"NVDA",         "fh":"NVDA",     "type":"stock", "name":"NVIDIA"},
+    "ARM":   {"td":"ARM",          "fh":"ARM",      "type":"stock", "name":"ARM Holdings"},
+    # Industrials / Energy
+    "VLO":   {"td":"VLO",          "fh":"VLO",      "type":"stock", "name":"Valero Energy"},
+    "GM":    {"td":"GM",           "fh":"GM",       "type":"stock", "name":"General Motors"},
+    # Consumer / Lusso
+    "MC":    {"td":"MC:EPA",       "fh":"MC.PA",    "type":"stock", "name":"LVMH"},
+    "DIS":   {"td":"DIS",          "fh":"DIS",      "type":"stock", "name":"Disney"},
+    "KO":    {"td":"KO",           "fh":"KO",       "type":"stock", "name":"Coca-Cola"},
+    # Forex
+    "EUR/USD":{"td":"EUR/USD",     "fh":"OANDA:EUR_USD", "type":"forex", "name":"EUR/USD"},
+    "USD/JPY":{"td":"USD/JPY",     "fh":"OANDA:USD_JPY", "type":"forex", "name":"USD/JPY"},
+    "GBP/USD":{"td":"GBP/USD",     "fh":"OANDA:GBP_USD", "type":"forex", "name":"GBP/USD"},
+    # Crypto
+    "ETH/USD":{"td":"ETH/USD",     "fh":"",         "type":"crypto","name":"Ethereum/USD"},
+    "BTC/USD":{"td":"BTC/USD",     "fh":"",         "type":"crypto","name":"Bitcoin/USD"},
+}
 
-# quali asset usano M1 oltre a M15/H1
-M1_WHITELIST = {a["name"] for a in ASSETS if a["type"] in ("forex","crypto")}
+# =========================
+# TIMEFRAME
+# =========================
+TFS = {
+    "M1":  {"td":"1min",  "fh":"1"},
+    "M15": {"td":"15min", "fh":"15"},
+    "H1":  {"td":"1h",    "fh":"60"},
+    "D1":  {"td":"1day",  "fh":"D"},
+}
+
+# =========================
+# STATO: per evitare duplicati
+# =========================
+last_signal_key = {}  # {(symbol, tf): candle_time_iso}
+app = Flask(__name__)
 
 # =========================
 # UTILS
@@ -64,482 +78,474 @@ M1_WHITELIST = {a["name"] for a in ASSETS if a["type"] in ("forex","crypto")}
 def now_rome():
     return datetime.now(TZ)
 
-def within_active_hours(ts: datetime):
-    start = ts.replace(hour=ACTIVE_START[0], minute=ACTIVE_START[1], second=0, microsecond=0)
-    end   = ts.replace(hour=ACTIVE_END[0],   minute=ACTIVE_END[1],   second=0, microsecond=0)
-    return start <= ts <= end
+def in_active_hours(dt=None):
+    dt = dt or now_rome()
+    start = dt.replace(hour=ACTIVE_START[0], minute=ACTIVE_START[1], second=0, microsecond=0)
+    end   = dt.replace(hour=ACTIVE_END[0],   minute=ACTIVE_END[1],   second=0, microsecond=0)
+    return start <= dt <= end
 
-def unix_time(dt):
-    return int(dt.timestamp())
+def star_bar(score):
+    # score 0-10 -> 5 stelle
+    full = int(round(score/2.0))
+    return "★"*full + "☆"*(5-full)
 
-def safe_float(x):
-    try: return float(x)
-    except: return np.nan
+def pct(x):
+    return f"{int(round(10* x))/10:.1f}%"
 
-def pct(a, b):
-    if b == 0 or math.isclose(b,0.0): return 0.0
-    return 100.0 * (a - b) / b
-
-def stars_from_score(score):
-    # 0..10 -> 0..5 stelle (½ arrotondato)
-    s = max(0, min(10, int(round(score))))
-    half = s / 2.0
-    full = int(half)
-    half_star = (half - full) >= 0.5
-    return "★" * full + ("½" if half_star else "") + "☆" * (5 - full - (1 if half_star else 0))
+def safe_float(x, default=np.nan):
+    try:
+        return float(x)
+    except:
+        return default
 
 # =========================
 # DATA PROVIDERS
 # =========================
-def fetch_finnhub_candles(symbol, market_type, resolution, bars=300):
+def fetch_td(symbol_td, tf_td, limit=300):
     """
-    resolution: '1','5','15','60','D'
-    market_type: 'equity' | 'forex' | 'crypto'
+    TwelveData time_series
     """
-    if not FINNHUB_API_KEY:
-        return None
-    end = int(time.time())
-    # 300 bars* interval
-    if resolution == 'D':
-        start = end - 86400*500
-    elif resolution == '60':
-        start = end - 3600*500
-    elif resolution == '15':
-        start = end - 900*500
-    elif resolution == '5':
-        start = end - 300*500
-    else:
-        start = end - 60*500
-    base = "https://finnhub.io/api/v1"
-    if market_type == 'equity':
-        url = f"{base}/stock/candle"
-        params = {"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": FINNHUB_API_KEY}
-    elif market_type == 'forex':
-        url = f"{base}/forex/candle"
-        params = {"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": FINNHUB_API_KEY}
-    else: # crypto
-        url = f"{base}/crypto/candle"
-        params = {"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": FINNHUB_API_KEY}
-
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        return None
-    j = r.json()
-    if j.get("s") != "ok":
-        return None
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(j["t"], unit="s"),
-        "open": j["o"], "high": j["h"], "low": j["l"], "close": j["c"], "volume": j.get("v", [np.nan]*len(j["c"]))
-    })
-    df = df.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
-    return df
-
-def fetch_twelvedata_series(symbol, interval, outputsize=300):
-    if not TWELVEDATA_API_KEY:
+    if not TWELVEDATA_API_KEY or not symbol_td:
         return None
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
+        "symbol": symbol_td,
+        "interval": tf_td,
+        "outputsize": str(limit),
+        "order": "asc",
+        "apikey": TWELVEDATA_API_KEY
     }
-    r = requests.get(url, params=params, timeout=25)
+    r = requests.get(url, params=params, timeout=20)
     if r.status_code != 200:
         return None
-    j = r.json()
-    if "values" not in j:
+    data = r.json()
+    if "values" not in data:
         return None
-    vals = j["values"]
-    df = pd.DataFrame(vals)
-    # TD returns strings
+    df = pd.DataFrame(data["values"])
+    # cols: datetime, open, high, low, close, volume
     for c in ["open","high","low","close","volume"]:
-        if c in df.columns:
-            df[c] = df[c].apply(safe_float)
+        df[c] = df[c].astype(float)
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
-    return df[["datetime","open","high","low","close","volume"]]
+    return df
 
-def get_ohlc(asset_name, tf):
+def fetch_fh_stock(symbol_fh, tf_fh, limit=300):
+    if not FINNHUB_API_KEY or not symbol_fh:
+        return None
+    url = "https://finnhub.io/api/v1/stock/candle"
+    params = {"symbol":symbol_fh, "resolution":tf_fh, "count":limit, "token":FINNHUB_API_KEY}
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code!=200:
+        return None
+    js = r.json()
+    if js.get("s")!="ok":
+        return None
+    df = pd.DataFrame({"datetime": pd.to_datetime(js["t"], unit="s"),
+                       "open": js["o"], "high": js["h"], "low": js["l"], "close": js["c"], "volume": js["v"]})
+    df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
+
+def fetch_fh_fx(symbol_fh, tf_fh, limit=300):
+    if not FINNHUB_API_KEY or not symbol_fh:
+        return None
+    url = "https://finnhub.io/api/v1/forex/candle"
+    params = {"symbol":symbol_fh, "resolution":tf_fh, "count":limit, "token":FINNHUB_API_KEY}
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code!=200:
+        return None
+    js = r.json()
+    if js.get("s")!="ok":
+        return None
+    df = pd.DataFrame({"datetime": pd.to_datetime(js["t"], unit="s"),
+                       "open": js["o"], "high": js["h"], "low": js["l"], "close": js["c"], "volume": js["v"]})
+    df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
+
+def get_ohlc(symbol_key, tf_key, limit=300):
     """
-    tf: '1min' | '15min' | '1h' | '1day'
-    maps to Finnhub resolutions: '1','15','60','D'
+    Prova TwelveData -> Finnhub (fallback)
+    tf_key: 'M1'|'M15'|'H1'|'D1'
     """
-    asset = next(a for a in ASSETS if a["name"] == asset_name)
-    res_map = {"1min":"1", "15min":"15", "1h":"60", "1day":"D"}
-    # 1) prova Finnhub
-    df = fetch_finnhub_candles(asset["fin"], asset["type"], res_map[tf])
-    if df is not None and len(df) > 50:
+    m = ASSETS[symbol_key]
+    tf = TFS[tf_key]
+    # Primary: TwelveData
+    df = fetch_td(m["td"], tf["td"], limit=limit)
+    if df is not None and len(df)>=50:
         return df
-    # 2) fallback TwelveData
-    td = {"1min":"1min","15min":"15min","1h":"1h","1day":"1day"}[tf]
-    df2 = fetch_twelvedata_series(asset["td"], td, outputsize=400 if tf!="1day" else 600)
-    return df2
+    # Fallback: Finnhub
+    if m["type"]=="stock":
+        df = fetch_fh_stock(m["fh"], tf["fh"], limit=limit)
+    elif m["type"]=="forex":
+        df = fetch_fh_fx(m["fh"], tf["fh"], limit=limit)
+    else:
+        df = None  # crypto: preferiamo TD
+    return df
 
 # =========================
 # INDICATORI
 # =========================
-def ema(series, n):
-    return series.ewm(span=n, adjust=False).mean()
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
-def rsi(series, n=14):
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -1*delta.clip(upper=0.0)
-    ma_up = up.ewm(alpha=1/n, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/n, adjust=False).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    rsi = 100 - (100/(1+rs))
-    return rsi.fillna(50.0)
+def rsi(close, period=14):
+    delta = close.diff()
+    up = np.where(delta>0, delta, 0.0)
+    down = np.where(delta<0, -delta, 0.0)
+    roll_up = pd.Series(up, index=close.index).ewm(alpha=1/period, adjust=False).mean()
+    roll_down = pd.Series(down, index=close.index).ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-10)
+    return 100 - (100/(1+rs))
 
-def bollinger_width(close, n=20):
-    ma = close.rolling(n).mean()
-    std = close.rolling(n).std(ddof=0)
-    upper = ma + 2*std
-    lower = ma - 2*std
-    width = (upper - lower) / ma
-    return width, ma, upper, lower
+def bbands(close, length=20, stdev=2):
+    ma = close.rolling(length).mean()
+    sd = close.rolling(length).std(ddof=0)
+    upper = ma + stdev*sd
+    lower = ma - stdev*sd
+    width = (upper - lower) / (ma.replace(0,np.nan)).abs()
+    return ma, upper, lower, width
 
-def ema_distance(close, n1=20, n2=50):
-    e1 = ema(close, n1)
-    e2 = ema(close, n2)
-    dist = (e1 - e2).abs() / close
-    trend_up = (close > e1) & (e1 > e2)
-    trend_dn = (close < e1) & (e1 < e2)
-    return dist, trend_up, trend_dn, e1, e2
+def atr(df, period=14):
+    h,l,c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([
+        (h-l).abs(),
+        (h - prev_c).abs(),
+        (l - prev_c).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-def volume_surge(vol, n=20):
-    base = vol.rolling(n).mean()
-    return vol / (base.replace(0,np.nan))
+def slope(series, length=10):
+    # pendenza semplice: regressione lineare su indice
+    if len(series) < length:
+        return pd.Series([np.nan]*len(series), index=series.index)
+    out = []
+    for i in range(len(series)):
+        if i < length-1:
+            out.append(np.nan)
+            continue
+        y = series.iloc[i-length+1:i+1]
+        x = np.arange(length)
+        A = np.vstack([x, np.ones(len(x))]).T
+        m, b = np.linalg.lstsq(A, y.values, rcond=None)[0]
+        out.append(m)
+    return pd.Series(out, index=series.index)
 
-def bb_compression_percentile(width, lookback=120):
-    # percentile del valore attuale rispetto alla storia recente
-    hist = width.tail(lookback+1).iloc[:-1].dropna()
-    if len(hist) < 10 or math.isnan(width.iloc[-1]):
-        return 100.0
-    rank = sum(hist <= width.iloc[-1]) / len(hist) * 100.0
-    return rank
+def detect_triangle(df, lookback=20):
+    # Heuristica leggera: HH in calo e LL in aumento
+    highs = df["high"].rolling(lookback).max()
+    lows  = df["low"].rolling(lookback).min()
+    # approssimiamo pendenza di linee HH e LL
+    hh_slope = slope(highs.fillna(method="bfill"), length=min(lookback, 10))
+    ll_slope = slope(lows.fillna(method="bfill"),  length=min(lookback, 10))
+    if pd.isna(hh_slope.iloc[-1]) or pd.isna(ll_slope.iloc[-1]):
+        return False
+    return (hh_slope.iloc[-1] < 0) and (ll_slope.iloc[-1] > 0)
 
-def simple_support_resistance(df, lookback=40, swing=3):
-    # trova swing high/low recenti
+def support_resistance(df, left=3, right=3):
+    # pivot semplice ultimo
     highs = df["high"].values
     lows  = df["low"].values
-    res_levels = []
-    sup_levels = []
-    for i in range(swing, len(df)-swing):
-        if highs[i] == max(highs[i-swing:i+swing+1]):
-            res_levels.append(highs[i])
-        if lows[i] == min(lows[i-swing:i+swing+1]):
-            sup_levels.append(lows[i])
-    res = np.median(res_levels[-5:]) if res_levels else np.nan
-    sup = np.median(sup_levels[-5:]) if sup_levels else np.nan
-    return sup, res
+    n = len(df)
+    sr = {"support": None, "resistance": None}
+    for i in range(n-right-1, left+right, -1):
+        # pivot high
+        if all(highs[i] > highs[i-j] for j in range(1, left+1)) and all(highs[i] > highs[i+j] for j in range(1, right+1)):
+            sr["resistance"] = highs[i]; break
+    for i in range(n-right-1, left+right, -1):
+        # pivot low
+        if all(lows[i] < lows[i-j] for j in range(1, left+1)) and all(lows[i] < lows[i+j] for j in range(1, right+1)):
+            sr["support"] = lows[i]; break
+    return sr
 
-def triangle_flag_heuristic(df, window=30):
-    seg = df.tail(window)
-    highs = seg["high"].reset_index(drop=True)
-    lows  = seg["low"].reset_index(drop=True)
-    x = np.arange(len(seg))
-    # regressione lineare
-    def slope(y):
-        xmean = x.mean(); ymean = y.mean()
-        num = ((x - xmean)*(y - ymean)).sum()
-        den = ((x - xmean)**2).sum()
-        return num/den if den!=0 else 0.0
-    s_high = slope(highs.values)
-    s_low  = slope(lows.values)
-    # convergenza se opposte e in modulo non troppo grandi
-    if (s_high < 0 and s_low > 0) and (abs(s_high)+abs(s_low) < (highs.mean()*0.02)):
-        return "triangolo"
-    # flag: trend deciso + canalino leggero contrario
-    closes = seg["close"].values
-    trend = slope(pd.Series(closes))
-    if abs(trend) > (seg["close"].mean()*0.02):
-        return "flag"
-    return None
+def weekly_cycle_heatmap(d1_df):
+    # Fasi: accumulo / esplosione / correzione / recupero
+    if d1_df is None or len(d1_df)<60:
+        return "—"
+    # settimanalizza
+    w = d1_df.set_index("datetime")[["close","high","low"]].resample("W").last().dropna()
+    e20 = ema(w["close"], 10)
+    e50 = ema(w["close"], 20)
+    bw_ma, up, lo, bw = bbands(w["close"], 20, 2)
+    atr_w = (w["high"]-w["low"]).rolling(6).mean()
+    cond_trend_up = (e20 > e50) & (e20.diff()>0)
+    cond_trend_dn = (e20 < e50) & (e20.diff()<0)
+    cond_compress = bw < bw.rolling(60).quantile(0.2)
+    phase = "accumulo"
+    if cond_trend_up.iloc[-1] and not cond_compress.iloc[-1]:
+        phase = "esplosione"
+    elif cond_trend_dn.iloc[-1] and not cond_compress.iloc[-1]:
+        phase = "correzione"
+    elif cond_compress.iloc[-1]:
+        phase = "accumulo"
+    else:
+        phase = "recupero"
+    return phase
 
-def weekly_phase_from_daily(df_d1):
-    # Fasi: accumulo (piatto con range stretto), esplosione (trend + range ampio), correzione (contro-trend)
-    closes = df_d1["close"]
-    width, ma, up, lo = bollinger_width(closes, n=20)
-    e20 = ema(closes, 20)
-    slope = (e20.iloc[-1] - e20.iloc[-5]) / (5 if len(e20)>5 else 1)
-    rng = (up - lo).iloc[-1]
-    narrow = bb_compression_percentile(width, lookback=100) < 30 and rng < (closes.iloc[-1]*0.06)
-    strong = abs(slope) > closes.iloc[-1]*0.002
-    if narrow and not strong:
-        return "accumulo"
-    if strong:
-        return "esplosione" if slope>0 else "correzione"
-    return "accumulo"
+def indicators_and_score(df):
+    """ Calcola indicatori + score long/short """
+    out = {}
+    if df is None or len(df) < 60:
+        out["ok"] = False
+        return out
+    df = df.copy()
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    df["rsi14"] = rsi(df["close"], 14)
+    ma, up, lo, bw = bbands(df["close"], 20, 2)
+    df["bb_mid"], df["bb_up"], df["bb_lo"], df["bb_bw"] = ma, up, lo, bw
+    df["atr14"] = atr(df, 14)
+    df["vol_sma20"] = df["volume"].rolling(20).mean()
+    df["ema20_slope"] = slope(df["ema20"].fillna(method="bfill"), 8)
 
-# =========================
-# STRATEGIA & SCORING
-# =========================
-def analyze_asset(asset):
-    name = asset["name"]
-    # --- timeframes
-    tfs = ["15min","1h"]
-    if name in M1_WHITELIST: tfs = ["1min"] + tfs
-    tfs += ["1day"]
+    # compressione: larghezza BB sotto 20° percentile su rolling 120
+    roll_quant = df["bb_bw"].rolling(120, min_periods=60).quantile(0.2)
+    df["compress"] = df["bb_bw"] < roll_quant
 
-    frames = {}
-    for tf in tfs:
-        df = get_ohlc(name, tf)
-        if df is None or len(df) < 60:
-            return None  # dati insufficienti -> skip
-        frames[tf] = df
+    # condizioni LONG
+    c = df.iloc[-1]
+    prev = df.iloc[-2]
+    long_pts = 0
+    short_pts = 0
 
-    # indicatori chiave su M15, H1
-    res = {"name": name, "calc":{}, "score":0, "flags":[]}
+    # trend
+    if c["ema20"] > c["ema50"]: long_pts += 1
+    if c["ema20"] < c["ema50"]: short_pts += 1
 
-    def calc_on(df):
-        out = {}
-        close = df["close"]
-        vol   = df["volume"].fillna(0)
-        width, ma, up, lo = bollinger_width(close, n=20)
-        dist, trend_up, trend_dn, e20, e50 = ema_distance(close, 20, 50)
-        r = {
-            "rsi": rsi(close, 14).iloc[-1],
-            "bb_width": width.iloc[-1],
-            "bb_pct": bb_compression_percentile(width, lookback=120),
-            "ema20": e20.iloc[-1],
-            "ema50": e50.iloc[-1],
-            "ema_dist": dist.iloc[-1],
-            "ema_dist_mean": dist.tail(30).mean(),
-            "volume_surge": volume_surge(vol, 20).iloc[-1],
-            "close": close.iloc[-1]
-        }
-        # breakout S/R
-        sup, resi = simple_support_resistance(df)
-        r["support"] = sup
-        r["resistance"] = resi
-        r["breakout_up"] = (not math.isnan(resi)) and (close.iloc[-1] > resi * 1.001)
-        r["breakout_dn"] = (not math.isnan(sup))  and (close.iloc[-1] < sup  * 0.999)
-        r["pattern"] = triangle_flag_heuristic(df)
-        r["trend_up"] = trend_up.iloc[-1]
-        r["trend_dn"] = trend_dn.iloc[-1]
-        return r
+    # momentum
+    if c["rsi14"] > 52: long_pts += 1
+    if c["rsi14"] < 48: short_pts += 1
 
-    m15 = calc_on(frames["15min"])
-    h1  = calc_on(frames["1h"])
-    res["calc"]["M15"] = m15
-    res["calc"]["H1"]  = h1
+    # posizione prezzo
+    if c["close"] > c["ema20"]: long_pts += 1
+    if c["close"] < c["ema20"]: short_pts += 1
 
-    # D1 per fase/alert speciale
-    d1  = calc_on(frames["1day"])
-    res["calc"]["D1"]  = d1
-    # compressione daily multi-day
-    d1_width_series, _, _, _ = bollinger_width(frames["1day"]["close"], 20)
-    d1_pct = bb_compression_percentile(d1_width_series, lookback=200)
-    res["calc"]["D1_pct"] = d1_pct
+    # compressione (pre-rally)
+    if bool(c["compress"]): 
+        long_pts += 2; short_pts += 2  # neutra ma propedeutica
 
-    # Direzione prevalente
-    long_bias  = (m15["trend_up"] or h1["trend_up"]) and m15["rsi"]>50 and h1["rsi"]>50
-    short_bias = (m15["trend_dn"] or h1["trend_dn"]) and m15["rsi"]<50 and h1["rsi"]<50
-    direction = "LONG" if long_bias and not short_bias else "SHORT" if short_bias and not long_bias else "NEUTRO"
-    res["direction"] = direction
+    # slope ema20
+    if c["ema20_slope"] > 0: long_pts += 1
+    if c["ema20_slope"] < 0: short_pts += 1
 
-    # Scoring (0-10)
-    score = 0
-    # 1) Compressione BB (più su M15)
-    if m15["bb_pct"] < 30: score += 2; res["flags"].append("BB squeeze M15")
-    if h1["bb_pct"]  < 30: score += 1
-    # 2) EMA squeeze 20/50
-    if m15["ema_dist"] < m15["ema_dist_mean"]*0.8: score += 1
-    if h1["ema_dist"]  < h1["ema_dist_mean"]*0.8: score += 1
-    # 3) RSI 50-cross / momentum
-    if 48 <= m15["rsi"] <= 55 or 48 <= h1["rsi"] <= 55: score += 2; res["flags"].append("RSI 50-cross")
-    # 4) Volume surge
-    if m15["volume_surge"] >= 1.5 or h1["volume_surge"] >= 1.5: score += 2; res["flags"].append("Volumi ↑")
-    # 5) Breakout S/R
-    if m15["breakout_up"] or h1["breakout_up"] or m15["breakout_dn"] or h1["breakout_dn"]:
-        score += 2; res["flags"].append("Breakout S/R")
-    # 6) Pattern
-    if m15["pattern"] or h1["pattern"]:
-        score += 1; res["flags"].append(f"Pattern {m15['pattern'] or h1['pattern']}")
+    # breakout micro: chiusura sopra banda alta / sotto banda bassa
+    if c["close"] > c["bb_up"]: long_pts += 2
+    if c["close"] < c["bb_lo"]: short_pts += 2
 
-    score = min(10, score)
-    res["score"] = score
+    # volume relativo
+    if c["volume"] > 1.2*(c["vol_sma20"] if not math.isnan(c["vol_sma20"]) else c["volume"]+1):
+        # volume alto avvalora la direzione della candela
+        if c["close"] >= prev["close"]: 
+            long_pts += 1
+        else:
+            short_pts += 1
 
-    # Heatmap settimanale (fase ciclo)
-    phase = weekly_phase_from_daily(frames["1day"])
-    res["weekly_phase"] = phase
+    # pattern base
+    pat_triangle = detect_triangle(df, 20)
+    if pat_triangle:
+        long_pts += 1; short_pts += 1
 
-    # Exceptional alert
-    exceptional = (score >= 10) and (d1_pct < 10)
-    res["exceptional"] = exceptional
+    direction = "LONG" if long_pts >= short_pts else "SHORT"
+    score = long_pts if direction=="LONG" else short_pts
 
-    return res
+    # supporti/resistenze
+    sr = support_resistance(df, 3, 3)
+    sr_flag = None
+    if sr["resistance"] and c["close"]>sr["resistance"]:
+        sr_flag = "Breakout Resistenza"
+        score += 1 if direction=="LONG" else 0
+    if sr["support"] and c["close"]<sr["support"]:
+        sr_flag = "Breakdown Supporto"
+        score += 1 if direction=="SHORT" else 0
+
+    out.update({
+        "ok": True,
+        "score": int(score),
+        "direction": direction,
+        "rsi": float(c["rsi14"]),
+        "ema20": float(c["ema20"]),
+        "ema50": float(c["ema50"]),
+        "bb_bw": float(c["bb_bw"]) if not math.isnan(c["bb_bw"]) else None,
+        "compress": bool(c["compress"]),
+        "pattern_triangle": bool(pat_triangle),
+        "sr_flag": sr_flag,
+        "last_dt": pd.to_datetime(df.iloc[-1]["datetime"]).to_pydatetime(),
+        "last_close": float(c["close"]),
+        "last_high": float(c["high"]),
+        "last_low": float(c["low"]),
+    })
+    return out
 
 # =========================
 # TELEGRAM
 # =========================
-def tg_send(html_text):
+def tg_send(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram secrets mancanti, messaggio non inviato.")
+        print("[TELEGRAM] Token/Chat ID non impostati. Messaggio:\n", text[:2000])
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": html_text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
     try:
-        r = requests.post(url, data=data, timeout=20)
-        if r.status_code != 200:
-            print("[TG] Errore invio:", r.text)
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code!=200:
+            print("Telegram error:", r.text[:500])
     except Exception as e:
-        print("[TG] Eccezione:", e)
+        print("Telegram exception:", e)
 
-def format_msg(result):
-    name = result["name"]
-    s = result["score"]
-    dirn = result["direction"]
-    stars = stars_from_score(s)
-    m15 = result["calc"]["M15"]
-    h1  = result["calc"]["H1"]
-    d1  = result["calc"]["D1"]
-    flags = " | ".join(result["flags"]) if result["flags"] else "—"
-
-    label_dir = ""
-    if dirn == "SHORT":
-        label_dir = "\n<b>🧭 Direzione: SHORT (ribasso)</b>"
-
-    hot = ""
-    if result["weekly_phase"] == "esplosione" and s >= 7:
-        hot = "\n🔥 <b>Titolo caldo del ciclo</b>"
-
-    # Previsioni operative: percentuali (no parola "Probabilità")
-    # semplice ripartizione coerente con direzione e segnali
-    long_pct  = 50
-    short_pct = 50
-    if dirn == "LONG":
-        long_pct = min(85, 55 + int(s*3))
-        short_pct = 100 - long_pct
-    elif dirn == "SHORT":
-        short_pct = min(85, 55 + int(s*3))
-        long_pct = 100 - short_pct
-
-    # supporti/resistenze
-    sup_m15 = m15["support"]; res_m15 = m15["resistance"]
-    sup_h1  = h1["support"];  res_h1  = h1["resistance"]
-
-    def fmt_level(x):
-        return f"{x:.4f}" if (x is not None and not math.isnan(x)) else "—"
-
-    header = (
-        f"<b>{name} — Pre‑rally Scanner</b>\n"
-        f"{stars}{hot}{label_dir}\n"
-        f"Fase ciclo (sett): <b>{result['weekly_phase']}</b>\n"
-        f"Score segnale: <b>{s}/10</b> | Trigger: <i>{flags}</i>\n"
+def format_signal(symbol_key, tf_key, ind, weekly_phase, asset_name):
+    dir_label = "🧭 Direzione: LONG (rialzo)" if ind["direction"]=="LONG" else "🧭 Direzione: SHORT (ribasso)"
+    stars = star_bar(ind["score"])
+    compress_txt = "Compressione attiva ✅" if ind["compress"] else "Compressione assente"
+    sr_txt = f" | <b>{ind['sr_flag']}</b>" if ind.get("sr_flag") else ""
+    patt_txt = "Triangolo ↗↘ rilevato" if ind["pattern_triangle"] else "Pattern: —"
+    hot = "🔥 Titolo caldo del ciclo" if (weekly_phase=="esplosione" and ind["score"]>=7) else ""
+    when = ind["last_dt"].astimezone(TZ).strftime("%d/%m %H:%M")
+    header = f"<b>{asset_name} ({symbol_key}) · {tf_key}</b>\n{stars}"
+    body = (
+        f"{dir_label}\n"
+        f"Prezzo: <b>{ind['last_close']:.4f}</b>  | RSI14: <b>{ind['rsi']:.1f}</b>\n"
+        f"EMA20 {ind['ema20']:.4f} · EMA50 {ind['ema50']:.4f}\n"
+        f"{compress_txt}{sr_txt}\n"
+        f"{patt_txt} · Fase ciclo settimanale: <b>{weekly_phase}</b>\n"
+        f"<i>{APP_NAME} v{VERSION} · {when}</i>"
     )
+    return f"{header}\n\n{body}\n{hot}".strip()
 
-    # mini tabella timeframe
-    tf_block = (
-        "<b>Timeframe</b>\n"
-        f"M15 — RSI {m15['rsi']:.1f} | BB%tile {m15['bb_pct']:.0f} | Vol x{m15['volume_surge']:.2f} | "
-        f"S {fmt_level(sup_m15)} / R {fmt_level(res_m15)} | "
-        f"BRK ⬆ { '✓' if m15['breakout_up'] else '–' } ⬇ { '✓' if m15['breakout_dn'] else '–' }\n"
-        f"H1  — RSI {h1['rsi']:.1f}  | BB%tile {h1['bb_pct']:.0f}  | Vol x{h1['volume_surge']:.2f}  | "
-        f"S {fmt_level(sup_h1)} / R {fmt_level(res_h1)}  | "
-        f"BRK ⬆ { '✓' if h1['breakout_up'] else '–' } ⬇ { '✓' if h1['breakout_dn'] else '–' }\n"
-        f"D1  — BB%tile {result['calc']['D1_pct']:.0f} | EMA20 vs 50: "
-        f"{'↑' if d1['trend_up'] else ('↓' if d1['trend_dn'] else '→')}\n"
-    )
-
-    # Previsione operativa
-    prev = (
-        "<b>Previsione operativa</b>\n"
-        f"{long_pct}% — Scenario LONG: breakout/ritest sopra R H1, RSI>52 su M15, "
-        f"volumi ≥1.5x; gestione su pullback EMA20 M15.\n"
-        f"{short_pct}% — Scenario SHORT: perdita S H1 e chiusure sotto EMA20/50, "
-        f"RSI<48 su M15, volumi ≥1.5x; pullback falliti verso R per continuazione.\n"
-    )
-
-    consiglio = (
-        "<i>Consiglio personale:</i> attendi conferma su M15 (candela chiara + volume) "
-        "e verifica allineamento H1. Evita entrate in mezzo al range; meglio "
-        "break+retest o pullback su EMA20 M15. Stop sempre oltre S/R.\n"
-    )
-
-    exceptional = ""
-    if result["exceptional"]:
-        exceptional = "\n<b>⚠️ Segnale eccezionale</b>: Score 10/10 + compressione D1 multi‑day. " \
-                      "Contesto favorevole a espansione di volatilità."
-
-    return header + "\n" + tf_block + "\n" + prev + "\n" + consiglio + exceptional
+def format_exceptional(symbol_key, asset_name, tf_key, ind):
+    when = ind["last_dt"].astimezone(TZ).strftime("%d/%m %H:%M")
+    title = f"〽️ <b>SEGNALE ECCEZIONALE</b> · {asset_name} ({symbol_key}) · {tf_key}"
+    stars = "★★★★★"
+    line1 = f"{stars}  Score: <b>{ind['score']}/10</b>  |  {('LONG' if ind['direction']=='LONG' else 'SHORT')}"
+    line2 = f"Compressione multi‑day su D1 + trigger {tf_key} confermato"
+    line3 = f"Prezzo {ind['last_close']:.4f} · RSI {ind['rsi']:.1f} · EMA20 {ind['ema20']:.4f} / EMA50 {ind['ema50']:.4f}"
+    line4 = f"<i>{APP_NAME} v{VERSION} · {when}</i>"
+    return "\n".join([title, line1, line2, line3, line4])
 
 # =========================
-# LOOP PROGRAMMATO
+# SCAN LOGIC
 # =========================
-_last_run_key = None
+def candle_key(dt, tf_key):
+    # normalizza timestamp della candela per anti-duplicati
+    if tf_key=="M1":
+        k = dt.replace(second=0, microsecond=0)
+    elif tf_key=="M15":
+        minute = (dt.minute//15)*15
+        k = dt.replace(minute=minute, second=0, microsecond=0)
+    elif tf_key=="H1":
+        k = dt.replace(minute=0, second=0, microsecond=0)
+    else:
+        k = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return k.isoformat()
 
-def should_run_now(ts):
-    # Allinea ai multipli di 15 min
-    return ts.minute % CHECK_EVERY_MIN == 0
+def exceptional_check(symbol_key, ind):
+    if not SEND_EXCEPTIONAL or ind["score"]<10:
+        return False
+    # compressione forte su D1
+    d1 = get_ohlc(symbol_key, "D1", limit=200)
+    if d1 is None or len(d1)<120:
+        return False
+    ma, up, lo, bw = bbands(d1["close"], 20, 2)
+    last_bw = float(bw.iloc[-1]) if not math.isnan(bw.iloc[-1]) else None
+    thr = float(bw.rolling(120).quantile(0.15).iloc[-1]) if len(bw.dropna())>50 else None
+    if last_bw and thr and last_bw < thr:
+        return True
+    return False
 
-def runner_loop():
-    global _last_run_key
-    print("[INIT] Runner avviato.")
+def run_scan_for_timeframe(tf_key):
+    for sym, meta in ASSETS.items():
+        # M1 solo forex/crypto
+        if tf_key=="M1" and meta["type"] not in ("forex","crypto"):
+            continue
+        try:
+            df = get_ohlc(sym, tf_key, limit=320)
+            if df is None or len(df)<60:
+                print(f"[{tf_key}] {sym}: dati insufficienti")
+                continue
+            ind = indicators_and_score(df)
+            if not ind.get("ok"):
+                continue
+
+            # anti-duplicati per candela
+            k = (sym, tf_key)
+            ck = candle_key(ind["last_dt"], tf_key)
+            if last_signal_key.get(k)==ck:
+                continue
+
+            # filtro score
+            if ind["score"] < MIN_SCORE:
+                continue
+
+            # ciclo settimanale (usa D1)
+            d1 = get_ohlc(sym, "D1", limit=220)
+            weekly_phase = weekly_cycle_heatmap(d1)
+
+            text = format_signal(sym, tf_key, ind, weekly_phase, meta["name"])
+            tg_send(text)
+
+            # eccezionale
+            if exceptional_check(sym, ind):
+                tg_send(format_exceptional(sym, meta["name"], tf_key, ind))
+
+            last_signal_key[k] = ck
+
+        except Exception as e:
+            print(f"Errore su {sym} {tf_key}:", e)
+            traceback.print_exc()
+
+def boundary_minutes(dt):
+    return {
+        "M1": True,
+        "M15": dt.minute % 15 == 0,
+        "H1": dt.minute == 0
+    }
+
+def scheduler_loop():
+    print(f"== {APP_NAME} v{VERSION} avviato ==")
     while True:
         try:
-            ts = now_rome()
-            key = ts.strftime("%Y-%m-%d %H:%M")
-            if within_active_hours(ts) and should_run_now(ts) and key != _last_run_key:
-                _last_run_key = key
-                print(f"[RUN] {key}")
-                run_scan_cycle()
-            time.sleep(5)  # controllo ogni 5s per beccare il minuto giusto
-        except Exception:
-            print("[ERR] Loop:", traceback.format_exc())
-            time.sleep(5)
-
-def run_scan_cycle():
-    for asset in ASSETS:
-        try:
-            res = analyze_asset(asset)
-            if not res: 
-                print(f"[SKIP] Dati insufficienti per {asset['name']}")
-                continue
-            if res["score"] >= MIN_SCORE_TO_ALERT:
-                msg = format_msg(res)
-                tg_send(msg)
-                print(f"[ALERT] {asset['name']} score={res['score']} dir={res['direction']}")
+            dt = now_rome()
+            if in_active_hours(dt):
+                b = boundary_minutes(dt)
+                if b["H1"]:
+                    run_scan_for_timeframe("H1")
+                if b["M15"]:
+                    run_scan_for_timeframe("M15")
+                # M1: solo fx/crypto, ogni minuto
+                run_scan_for_timeframe("M1")
             else:
-                print(f"[NOALERT] {asset['name']} score={res['score']}")
-            # piccola pausa per non stressare provider fallback
-            time.sleep(0.3)
-        except Exception:
-            print(f"[ERR] analyze {asset['name']}:", traceback.format_exc())
-            time.sleep(0.5)
+                # reset anti-duplicati a fine giornata
+                if dt.hour == 23 and dt.minute >= 1:
+                    last_signal_key.clear()
+            # sincronizza al prossimo minuto
+            sleep_s = 60 - dt.second
+            time.sleep(max(1, sleep_s))
+        except Exception as e:
+            print("Scheduler exception:", e)
+            time.sleep(10)
 
 # =========================
-# WEB SERVER (Render)
+# FLASK (health + trigger)
 # =========================
-app = Flask(__name__)
+@app.route("/")
+def home():
+    return jsonify({"app": APP_NAME, "version": VERSION, "status":"ok", "time": now_rome().isoformat()})
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "time": now_rome().isoformat()})
-
-@app.get("/")
-def root():
-    return "Bot pre‑rally attivo. Usa /health per check."
+@app.route("/force", methods=["POST","GET"])
+def force():
+    tf = request.args.get("tf","M15").upper()
+    if tf not in ("M1","M15","H1","D1"):
+        tf = "M15"
+    run_scan_for_timeframe(tf)
+    return jsonify({"forced": tf, "time": now_rome().isoformat()})
 
 def main():
-    # Avvia runner in background
-    t = threading.Thread(target=runner_loop, daemon=True)
+    # avvio thread scheduler
+    t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
-    # Flask web (Render usa PORT)
+    # avvio web
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
-@app.get("/scan-now")
-def scan_now():
-    run_scan_cycle()
-    return jsonify({"run": "ok", "time": now_rome().isoformat()})
