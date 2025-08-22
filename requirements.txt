@@ -1,9 +1,11 @@
-setuptools
+pip<24
+setuptools>=65.5.0
 wheel
+
 flask
 python-dotenv
 requests
 pandas==1.5.3
 numpy==1.23.5
 pandas_ta==0.3.14b0
-pytz
+pytz 
