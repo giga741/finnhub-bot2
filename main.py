@@ -7,51 +7,40 @@ import pytz
 from flask import Flask, jsonify, request
 
 # =========================
-# CONFIG
+# CONFIG BASE
 # =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN","").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","").strip()
+APP_NAME = "Pre‑Rally Scanner (FH primary, TD fallback)"
+VERSION = "1.1.0"
+
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY","").strip()
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY","").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN","").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","").strip()
 
 TZ = pytz.timezone("Europe/Rome")
 ACTIVE_START = (8,45)   # 08:45
 ACTIVE_END   = (23,0)   # 23:00
 
-APP_NAME = "Pre‑Rally Scanner (FH primary, TD fallback)"
-VERSION = "1.0.0"
-
 # =========================
-# LISTA 13 TITOLI USA (no UE/Forex/Crypto)
-# Finnhub: tickers US standard
-# TwelveData: stessi tickers (US)
+# LISTA 13 TITOLI USA (finale)
 # =========================
-ASSETS = {
-    "PLTR":{"fh":"PLTR","td":"PLTR","name":"Palantir"},
-    "GOOGL":{"fh":"GOOGL","td":"GOOGL","name":"Alphabet A"},
-    "TSLA":{"fh":"TSLA","td":"TSLA","name":"Tesla"},
-    "NVDA":{"fh":"NVDA","td":"NVDA","name":"NVIDIA"},
-    "AMD":{"fh":"AMD","td":"AMD","name":"AMD"},
-    "MU":{"fh":"MU","td":"MU","name":"Micron"},
-    "VLO":{"fh":"VLO","td":"VLO","name":"Valero Energy"},
-    "GM":{"fh":"GM","td":"GM","name":"General Motors"},
-    "XOM":{"fh":"XOM","td":"XOM","name":"Exxon Mobil"},
-    "DIS":{"fh":"DIS","td":"DIS","name":"Disney"},
-    "KO":{"fh":"KO","td":"KO","name":"Coca-Cola"},
-    "JPM":{"fh":"JPM","td":"JPM","name":"JPMorgan"},
-    "BAC":{"fh":"BAC","td":"BAC","name":"Bank of America"},
-}
+ASSETS = [
+    "PLTR","GOOGL","TSLA","NVDA","AMD","MU",   # Tech 6
+    "VLO","GM","XOM",                           # Industrials/Energy 3
+    "DIS","KO",                                 # Consumer/Media 2
+    "JPM","BAC"                                 # Financial 2
+]
 
 # =========================
 # TIMEFRAMES
 # =========================
 TFS = {
-    "M15":{"fh":"15","td":"15min"},
-    "H1":{"fh":"60","td":"1h"},
-    "D1":{"fh":"D","td":"1day"},
+    "M15": {"fh":"15", "td":"15min"},
+    "H1":  {"fh":"60", "td":"1h"},
+    "D1":  {"fh":"D",  "td":"1day"},
 }
 
-# Anti-duplicati: 1 segnale per candela/timeframe
+# Anti-duplicati (1 segnale per candela/timeframe)
 last_signal_key = {}  # {(symbol, tf): iso_of_candle}
 
 app = Flask(__name__)
@@ -98,57 +87,67 @@ def candle_key(dt, tf_key):
         k = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     return k.isoformat()
 
+def tg_send(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM-MOCK]\n", text[:1000])
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print("Telegram error:", r.text[:400])
+    except Exception as e:
+        print("Telegram exception:", e)
+
 # =========================
 # DATA PROVIDERS
 # =========================
-def fh_fetch(symbol, resolution, limit=300):
+def fh_fetch(symbol, resolution, limit=320):
     if not FINNHUB_API_KEY: return None
-    url = "https://finnhub.io/api/v1/stock/candle"
-    params = {"symbol": symbol, "resolution": resolution, "count": limit, "token": FINNHUB_API_KEY}
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
+    try:
+        url = "https://finnhub.io/api/v1/stock/candle"
+        params = {"symbol": symbol, "resolution": resolution, "count": limit, "token": FINNHUB_API_KEY}
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200: return None
+        js = r.json()
+        if js.get("s") != "ok": return None
+        df = pd.DataFrame({
+            "datetime": pd.to_datetime(js["t"], unit="s"),
+            "open": js["o"], "high": js["h"], "low": js["l"], "close": js["c"], "volume": js["v"]
+        })
+        df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
+        df = df.sort_values("datetime").reset_index(drop=True)
+        return df
+    except Exception:
         return None
-    js = r.json()
-    if js.get("s") != "ok":
-        return None
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(js["t"], unit="s"),
-        "open": js["o"], "high": js["h"], "low": js["l"], "close": js["c"], "volume": js["v"]
-    })
-    df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
 
-def td_fetch(symbol, interval, limit=300):
+def td_fetch(symbol, interval, limit=320):
     if not TWELVEDATA_API_KEY: return None
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": interval, "outputsize": str(limit),
-        "order": "asc", "apikey": TWELVEDATA_API_KEY
-    }
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {"symbol": symbol, "interval": interval, "outputsize": str(limit), "order": "asc", "apikey": TWELVEDATA_API_KEY}
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200: return None
+        js = r.json()
+        if "values" not in js: return None
+        df = pd.DataFrame(js["values"])
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+        return df
+    except Exception:
         return None
-    js = r.json()
-    if "values" not in js:
-        return None
-    df = pd.DataFrame(js["values"])
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
 
-def get_ohlc(symbol_key, tf_key, limit=320):
-    """ Finnhub primario -> TwelveData fallback """
-    sym = ASSETS[symbol_key]
+def get_ohlc(symbol, tf_key, limit=320):
     tf = TFS[tf_key]
     # Primario: Finnhub
-    df = fh_fetch(sym["fh"], tf["fh"], limit=limit)
+    df = fh_fetch(symbol, tf["fh"], limit=limit)
     if df is not None and len(df) >= 80:
         return df
     # Fallback: TwelveData
-    df = td_fetch(sym["td"], tf["td"], limit=limit)
+    df = td_fetch(symbol, tf["td"], limit=limit)
     return df
 
 # =========================
@@ -176,7 +175,6 @@ def pre_rally_signal(df):
     bw_q20 = d["bb_bw"].rolling(120, min_periods=100).quantile(0.20)
     c = d.iloc[-1]
 
-    # condizioni
     cond_compress = (not math.isnan(c["bb_bw"])) and (not math.isnan(bw_q20.iloc[-1])) and (c["bb_bw"] < bw_q20.iloc[-1])
     cond_rsi_neutral = (40 <= c["rsi14"] <= 60)
     ema_rel_dist = abs(c["ema20"] - c["ema50"]) / max(abs(c["ema50"]), 1e-9)
@@ -197,24 +195,7 @@ def pre_rally_signal(df):
         "last_close": float(c["close"]),
     }
 
-# =========================
-# TELEGRAM
-# =========================
-def tg_send(text, chat_id=None):
-    chat_id = chat_id or TELEGRAM_CHAT_ID
-    if not TELEGRAM_TOKEN or not chat_id:
-        print("[TELEGRAM-MOCK]\n", text[:1200])
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            print("Telegram error:", r.text[:400])
-    except Exception as e:
-        print("Telegram exception:", e)
-
-def format_msg(symbol_key, tf_key, ind, asset_name):
+def format_msg(symbol, tf_key, ind):
     when = ind["last_dt"].astimezone(TZ).strftime("%d/%m %H:%M")
     bullets = []
     bullets.append("Compressione ✅" if ind["compress"] else "Compressione —")
@@ -227,7 +208,7 @@ def format_msg(symbol_key, tf_key, ind, asset_name):
     bullets.append("Vol OK" if ind["vol_ok"] else "Vol —")
 
     return (
-        f"<b>{asset_name} ({symbol_key}) · {tf_key}</b>\n"
+        f"<b>{symbol} · {tf_key}</b>\n"
         f"Setup: <b>Pre‑Rally</b> · Punti: <b>{ind['points']}</b>/4\n"
         f"Prezzo: <b>{ind['last_close']:.4f}</b>\n"
         f"{' · '.join(bullets)}\n"
@@ -235,17 +216,17 @@ def format_msg(symbol_key, tf_key, ind, asset_name):
     )
 
 # =========================
-# SCAN
+# SCAN & SCHEDULER
 # =========================
 def boundary_minutes(dt):
     return {
         "M15": dt.minute % 15 == 0,
-        "H1": dt.minute == 0,
-        "D1": dt.hour == 0 and dt.minute == 0
+        "H1":  dt.minute == 0,
+        "D1":  dt.hour == 0 and dt.minute == 0
     }
 
-def run_scan_for_timeframe(tf_key, chat_id=None):
-    for sym, meta in ASSETS.items():
+def run_scan_for_timeframe(tf_key):
+    for sym in ASSETS:
         try:
             df = get_ohlc(sym, tf_key, limit=240 if tf_key!="D1" else 400)
             if df is None or len(df) < 140:
@@ -260,7 +241,7 @@ def run_scan_for_timeframe(tf_key, chat_id=None):
             if last_signal_key.get(k) == ck:
                 continue
 
-            tg_send(format_msg(sym, tf_key, sig, meta["name"]), chat_id=chat_id)
+            tg_send(format_msg(sym, tf_key, sig))
             last_signal_key[k] = ck
 
         except Exception as e:
@@ -280,18 +261,21 @@ def scheduler_loop():
             else:
                 if dt.hour == 23 and dt.minute >= 1:
                     last_signal_key.clear()
-
             time.sleep(max(1, 60 - dt.second))
         except Exception as e:
             print("Scheduler exception:", e)
             time.sleep(10)
 
 # =========================
-# FLASK + WEBHOOK TELEGRAM (opzionale)
+# FLASK ROUTES
 # =========================
 @app.route("/")
 def home():
-    return jsonify({"app": APP_NAME, "version": VERSION, "status":"ok", "time": now_rome().isoformat()})
+    return jsonify({"status":"running","app":APP_NAME,"version":VERSION,"time":now_rome().isoformat()})
+
+@app.route("/health")
+def health():
+    return jsonify({"status":"ok","app":APP_NAME,"version":VERSION,"time":now_rome().isoformat()}), 200
 
 @app.route("/force", methods=["GET"])
 def force():
@@ -301,53 +285,11 @@ def force():
     run_scan_for_timeframe(tf)
     return jsonify({"forced_tf": tf, "t": now_rome().isoformat()})
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        upd = request.get_json(force=True)
-        msg = upd.get("message") or upd.get("edited_message")
-        if not msg: return jsonify({"ok":True})
-        chat_id = msg["chat"]["id"]
-        text = (msg.get("text") or "").strip()
-
-        if text.lower().startswith("/start"):
-            tg_send("Ciao! Comandi: \n- /start\n- analizza TICKER (es. 'analizza PLTR')\n- analizza tutto (scansione M15 adesso)", chat_id=chat_id)
-        elif text.lower().startswith("analizza tutto"):
-            run_scan_for_timeframe("M15", chat_id=chat_id)
-            tg_send("Scansione M15 inviata.", chat_id=chat_id)
-        elif text.lower().startswith("analizza"):
-            parts = text.split()
-            if len(parts)>=2:
-                ticker = parts[1].upper().replace(".US","")
-                if ticker in ASSETS:
-                    # scansione singolo simbolo su M15, H1, D1
-                    for tf in ["M15","H1","D1"]:
-                        try:
-                            df = get_ohlc(ticker, tf, limit=240 if tf!="D1" else 400)
-                            sig = pre_rally_signal(df) if df is not None else None
-                            if sig and sig["ok"]:
-                                tg_send(format_msg(ticker, tf, sig, ASSETS[ticker]["name"]), chat_id=chat_id)
-                        except Exception as e:
-                            print("analizza error", e)
-                    tg_send(f"Analisi completata per {ticker}.", chat_id=chat_id)
-                else:
-                    tg_send("Ticker non in lista. Tickers supportati: " + ", ".join(ASSETS.keys()), chat_id=chat_id)
-            else:
-                tg_send("Usa: analizza TICKER (es. analizza PLTR)", chat_id=chat_id)
-        else:
-            tg_send("Comandi: /start · analizza TICKER · analizza tutto", chat_id=chat_id)
-
-    except Exception as e:
-        print("webhook exception:", e)
-    return jsonify({"ok":True})
-
 def main():
-    # scheduler
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
-    # web
     port = int(os.getenv("PORT","10000"))
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    main()
+    main()                   
