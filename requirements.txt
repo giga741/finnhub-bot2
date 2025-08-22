@@ -1,3 +1,5 @@
+setuptools>=65.5.0
+wheel
 flask
 python-dotenv
 requests
